@@ -93,6 +93,10 @@ else
 fi
 
 echo "Use SOC_VERSION: $SOC_VERSION"
+if [[ "$BUILD_KERNELS_MODULE" == "ON" && ! "$SOC_VERSION" =~ ^Ascend910_93[0-9]{2}$ ]]; then
+    echo "Error: tp_ascendc_fusion kernels require Ascend910_93xx, got: $SOC_VERSION"
+    exit 1
+fi
 
 echo "=== Fixing ASCConfig for CANN 8.3 / A2 ==="
 
@@ -168,7 +172,7 @@ function build_kernels()
     -DASCEND_INCLUDE_DIR=$ASCEND_INCLUDE_DIR \
     -DCMAKE_PREFIX_PATH="$ASC_CMAKE_DIR" \
     -DASC_DIR="$ASC_CMAKE_DIR" \
-    -DSOC_VERSION=Ascend910_9382 \
+    -DSOC_VERSION="$SOC_VERSION" \
     -DDEEPEP_IS_A5_BUILD=$([[ "$SOC_VERSION" == "Ascend950" ]] && echo "ON" || echo "OFF") \
     -DBUILD_DEEPEP_MODULE=$BUILD_DEEPEP_MODULE \
     -DBUILD_KERNELS_MODULE=$BUILD_KERNELS_MODULE \

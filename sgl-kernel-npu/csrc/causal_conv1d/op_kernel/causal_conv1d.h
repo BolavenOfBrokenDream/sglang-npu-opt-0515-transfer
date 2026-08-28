@@ -345,6 +345,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
     const int32_t stateLen = tilingData_->stateLen;
     const int32_t width = static_cast<int32_t>(tilingData_->width);
     const int32_t ringStart = MAX_WIDTH - width;
+    const int64_t xRowStride = tilingData_->xRowStride;  // x 物理行距（元素数），旧算子恒=dim
     LocalTensor<T> ring = inBuf.Get<T>();
 
     for (int32_t i = 0; i < ringStart; ++i) {
@@ -372,7 +373,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
 
     if (len > 0) {
         const int32_t slot0 = SlotCurr(0);
-        const int64_t xOffset = static_cast<int64_t>(start) * dim + channelStart;
+        const int64_t xOffset = static_cast<int64_t>(start) * xRowStride + channelStart;
         DataCopy(ring[slot0 * MAX_BLOCK_DIM], xGm[xOffset], baseDim);
         SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slot0]);
     }
@@ -402,6 +403,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
     LocalTensor<T> outT = outBuf.Get<T>();
     const bool hasBias = HasBias();
     const bool hasActivation = HasActivation();
+    const int64_t xRowStride = tilingData_->xRowStride;  // x 物理行距（元素数），旧算子恒=dim
     for (int32_t t = 0; t < len; ++t) {
         const int32_t slotCurr = SlotCurr(t);
 
@@ -409,7 +411,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
 
         if (t + 1 < len) {
             const int32_t slotNext = SlotPrefetch(t);
-            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * dim + channelStart;
+            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * xRowStride + channelStart;
             WaitFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
             DataCopy(ring[slotNext * MAX_BLOCK_DIM], xGm[xOffsetNext], baseDim);
             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotNext]);
@@ -642,6 +644,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeqFnRolling(int32_t start, int32
     LocalTensor<T> ring = inBuf.Get<T>();
     LocalTensor<T> outT = outBuf.Get<T>();
     const bool hasActivation = HasActivation();
+    const int64_t xRowStride = tilingData_->xRowStride;  // x 物理行距（元素数），旧算子恒=dim
     RestoreFnLocalPartials(baseDim);
 
     for (int32_t t = 0; t < len; ++t) {
@@ -651,7 +654,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeqFnRolling(int32_t start, int32
 
         if (t + 1 < len) {
             const int32_t slotNext = SlotPrefetch(t);
-            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * dim + channelStart;
+            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * xRowStride + channelStart;
             WaitFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
             DataCopy(ring[slotNext * MAX_BLOCK_DIM], xGm[xOffsetNext], baseDim);
             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotNext]);
@@ -735,6 +738,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackStateSpec(int32_t cacheIdx,
 {
     const int32_t width = static_cast<int32_t>(tilingData_->width);
     const int32_t stateLen = tilingData_->stateLen;
+    const int64_t xRowStride = tilingData_->xRowStride;  // x 物理行距（元素数），旧算子恒=dim
     if (len <= 0) {
         return;
     }
@@ -788,7 +792,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackStateSpec(int32_t cacheIdx,
         WaitFlag<HardEvent::MTE3_MTE2>(stateShiftMte3ToMte2Event_);
     }
 
-    const int64_t xOffset0 = static_cast<int64_t>(start) * dim + channelStart;
+    const int64_t xOffset0 = static_cast<int64_t>(start) * xRowStride + channelStart;
     DataCopy(buf0, xGm[xOffset0], baseDim);
     SetFlag<HardEvent::MTE2_MTE3>(specWritebackMte2ToMte3Event_[0]);
 
@@ -801,7 +805,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackStateSpec(int32_t cacheIdx,
         WaitFlag<HardEvent::MTE2_MTE3>(specWritebackMte2ToMte3Event_[curr]);
 
         if (t + 1 < len) {
-            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * dim + channelStart;
+            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * xRowStride + channelStart;
             if (t > 0) {
                 WaitFlag<HardEvent::MTE3_MTE2>(specWritebackMte3ToMte2Event_[next]);
             }

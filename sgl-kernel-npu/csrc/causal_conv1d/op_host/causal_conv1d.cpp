@@ -70,6 +70,7 @@ struct CausalConv1dTilingKey {
     int64_t hasCacheIndices;
     int64_t hasInitialState;
     int64_t hasNumAccept;
+    int64_t xRowStride;  // x 物理行距入 hash；旧算子恒=dim
 };
 
 struct CausalConv1dTilingKeyHash {
@@ -97,6 +98,7 @@ struct CausalConv1dTilingKeyHash {
         h = HashCombine(h, static_cast<std::size_t>(k.hasCacheIndices));
         h = HashCombine(h, static_cast<std::size_t>(k.hasInitialState));
         h = HashCombine(h, static_cast<std::size_t>(k.hasNumAccept));
+        h = HashCombine(h, static_cast<std::size_t>(k.xRowStride));
         return h;
     }
 };
@@ -176,6 +178,7 @@ void ComputeTilingData(int64_t dim, int64_t cuSeqlen, int64_t seqLen, int64_t ba
     std::memset(&td, 0, sizeof(td));
 
     td.dim = dim;
+    td.xRowStride = dim;  // 旧算子行距恒=dim（numVHeads 由 memset 置 0）
     td.cuSeqlen = cuSeqlen;
     td.seqLen = seqLen;
     td.inputMode = inputMode;
@@ -362,7 +365,8 @@ HOST_API at::Tensor causal_conv1d_impl(const at::Tensor &x, const at::Tensor &we
                               hasBias ? 1 : 0,
                               hasCacheIndices ? 1 : 0,
                               hasInitialState ? 1 : 0,
-                              hasNumAccept ? 1 : 0};
+                              hasNumAccept ? 1 : 0,
+                              dim};
     uint64_t hashValue = CausalConv1dTilingKeyHash{}(key);
 
     static auto globalTilingBuffer = at::empty({tilingSize * static_cast<int64_t>(MAX_CAPTURE_NUM)},

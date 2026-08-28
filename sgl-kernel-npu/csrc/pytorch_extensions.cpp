@@ -17,6 +17,8 @@
 #include "sgl_kenel_npu_ops.h"
 #include "causal_conv1d_update/op_host/causal_conv1d_update.h"
 #include "causal_conv1d/op_host/causal_conv1d.h"
+#include "fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.h"
+#include "fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.h"
 
 namespace {
 TORCH_LIBRARY_FRAGMENT(npu, m)
@@ -147,6 +149,24 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor? query_start_loc=None, Tensor? cache_indices=None, Tensor? has_initial_state=None, "
         "Tensor? num_accepted_tokens=None, int activation_mode=0, int pad_slot_id=-1, "
         "int run_mode=0) -> Tensor");
+
+    // GDN decode split + causal_conv1d 单 kernel
+    m.def(
+        "fused_qkvzba_conv1d(Tensor qkvz, Tensor weight, Tensor conv_states, Tensor mixed_ba, "
+        "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, Tensor? bias=None, "
+        "Tensor? query_start_loc=None, Tensor? cache_indices=None, int activation_mode=0, "
+        "int pad_slot_id=-1) -> (Tensor, Tensor, Tensor, Tensor)");
+
+    // GDN decode recurrent（sigmoid gating + delta rule update）的 AscendC AIV 版，
+    // 仅 decode（T==N，每序列 1 token）；initial_state_source 为 ssm state pool、
+    // 原地更新；q/k/v 允许末维连续的 strided 视图（行 stride 显式传入）。
+    m.def(
+        "fused_sigmoid_gating_recurrent(Tensor A_log, Tensor a, Tensor dt_bias, "
+        "float softplus_beta, float softplus_threshold, "
+        "Tensor q, Tensor k, Tensor v, Tensor b, "
+        "Tensor(a!) initial_state_source, Tensor initial_state_indices, "
+        "float scale, Tensor cu_seqlens, bool use_qk_l2norm, "
+        "int q_row_stride, int k_row_stride, int v_row_stride) -> Tensor");
 }
 }  // namespace
 
@@ -246,5 +266,25 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
             x, weight, bias_or_empty, conv_states, query_start_loc_or_empty, cache_indices_or_empty,
             has_initial_state_or_empty, num_accepted_tokens_or_empty, activation_mode, pad_slot_id, run_mode);
     });
+
+    m.impl("fused_qkvzba_conv1d",
+           [](const at::Tensor &qkvz, const at::Tensor &weight, const at::Tensor &conv_states,
+              const at::Tensor &mixed_ba, int64_t num_k_heads, int64_t num_v_heads, int64_t head_k_dim,
+              int64_t head_v_dim, const c10::optional<at::Tensor> &bias,
+              const c10::optional<at::Tensor> &query_start_loc, const c10::optional<at::Tensor> &cache_indices,
+              int64_t activation_mode, int64_t pad_slot_id) {
+               // Handle optional parameters - convert None to empty tensors
+               auto bias_or_empty = bias.has_value() ? *bias : at::empty({0}, qkvz.options());
+               auto query_start_loc_or_empty =
+                   query_start_loc.has_value() ? *query_start_loc : at::empty({0}, qkvz.options().dtype(at::kLong));
+               auto cache_indices_or_empty =
+                   cache_indices.has_value() ? *cache_indices : at::empty({0}, qkvz.options().dtype(at::kLong));
+
+               return sglang::npu_kernel::fused_qkvzba_conv1d_impl(
+                   qkvz, weight, conv_states, mixed_ba, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+                   bias_or_empty, query_start_loc_or_empty, cache_indices_or_empty, activation_mode, pad_slot_id);
+           });
+
+    m.impl("fused_sigmoid_gating_recurrent", TORCH_FN(sglang::npu_kernel::fused_sigmoid_gating_recurrent_impl));
 }
 }  // namespace

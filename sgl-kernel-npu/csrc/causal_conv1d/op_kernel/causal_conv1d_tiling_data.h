@@ -62,5 +62,13 @@ struct CausalConv1dTilingData {
     int64_t runModeKey;
     int64_t widthKey;
     int64_t fnPlanKey;
+
+    int64_t xRowStride;  // x 物理行距（元素数）；host 侧旧算子恒填=dim
+    int64_t numVHeads;   // 供 fused_qkvzba_conv1d 的 b/a 拷贝用；旧算子恒 0（memset），不读取
+    // fused_qkvzba_conv1d 支持行距视图输入（打包 GEMM 的非连续输出直读）：
+    // zWidth 显式携带、不由 xRowStride-dim 反推；baRowStride 替代硬编码 2*numVHeads。
+    // 旧算子恒 0（memset），不读取。
+    int64_t zWidth;
+    int64_t baRowStride;
 };
 #endif  // CUSTOM_CAUSAL_CONV1D_TILING_DATA_H_
