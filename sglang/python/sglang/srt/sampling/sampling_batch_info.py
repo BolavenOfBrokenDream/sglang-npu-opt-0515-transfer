@@ -42,6 +42,12 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
+    # Whether all requests use temperature == 1.0 (computed host-side in
+    # from_schedule_batch; merge_batch takes the AND, filter_batch subsetting
+    # preserves it). True means logits.div_(temperatures) is a bitwise
+    # identity and the sampler skips it. Must sit after the non-default
+    # fields above (dataclass field ordering).
+    temperatures_all_one: bool = False
     grammars: Optional[List] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
@@ -191,6 +197,9 @@ class SamplingBatchInfo:
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            temperatures_all_one=all(
+                r.sampling_params.temperature == 1.0 for r in reqs
+            ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -412,6 +421,7 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        self.temperatures_all_one &= other.temperatures_all_one
 
         self.adjusted_merge_batch(other)
 

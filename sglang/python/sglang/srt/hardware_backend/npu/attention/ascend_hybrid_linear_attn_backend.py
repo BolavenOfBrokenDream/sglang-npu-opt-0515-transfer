@@ -27,16 +27,27 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.state_indices_list_gdn = []
+        # decode 的 int32 影子 buffer：AscendC recurrent host 按 int32_t* 读
+        # cache_indices/cu_seqlens，decode 图流程每 step 图外同步一次（图内零 cast）；
+        # eager/verify 路径恒 None。
+        self.decode_state_indices_i32_list = []
+        self.decode_query_start_loc_i32_list = []
+        self.cached_cuda_graph_decode_query_start_loc_i32 = None
+        self._decode_recurrent_shadow_i32 = None
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         draft_token_num = max_num_tokens // max_bs
+        # state_indices / query_start_loc 主 buffer 用 int64：conv 类 AscendC 算子
+        # （causal_conv1d / fused_qkvzba_conv1d）host 按 int64_t* 读，直喂可省图内 cast。
+        # 例外：state_indices_list_gdn 保持 int32（recurrent_gated_delta_rule 按
+        # int32_t* 读且无校验，改了会静默算错）。
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
-                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                    (i + 1,), self.pad_slot_id, dtype=torch.int64, device=self.device
                 )
             )
             self.state_indices_list_gdn.append(
@@ -48,7 +59,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 )
             )
             self.query_start_loc_list.append(
-                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
+                torch.zeros((i + 2,), dtype=torch.int64, device=self.device)
             )
             self.retrieve_next_token_list.append(
                 torch.zeros(
@@ -65,16 +76,52 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
+            # decode 影子 buffer（recurrent 侧），每 step 由
+            # _capture/_replay_metadata 图外同步；不在 verify 使用。
+            self.decode_state_indices_i32_list.append(
+                torch.full(
+                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
+            )
+            self.decode_query_start_loc_i32_list.append(
+                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
+            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
+            0, max_bs + 1, dtype=torch.int64, device=self.device
+        )
+        # decode query_start_loc 是静态 arange——int32 版 init 期预建，影子同步
+        # 只做同 dtype copy。
+        self.cached_cuda_graph_decode_query_start_loc_i32 = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
         self.cached_cuda_graph_verify_query_start_loc = torch.arange(
             0,
             max_bs * draft_token_num + 1,
             step=draft_token_num,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self.device,
         )
+
+    def _update_decode_recurrent_shadow_i32(
+        self, bs: int, mamba_indices: torch.Tensor, num_padding: int = 0
+    ):
+        """同步 decode 的 int32 影子 buffer（图外 eager，每 step 一次）。
+
+        内容与 int64 主 buffer 完全一致，供 AscendC recurrent（host 按 int32_t*
+        读 cache_indices/cu_seqlens）直读。仅 decode/idle 调用；verify/eager
+        路径由调用方把 _decode_recurrent_shadow_i32 置 None。
+        """
+        idx_i32 = self.decode_state_indices_i32_list[bs - 1]
+        qsl_i32 = self.decode_query_start_loc_i32_list[bs - 1]
+        idx_i32[: len(mamba_indices)].copy_(mamba_indices)
+        if num_padding == 0:
+            qsl_i32.copy_(self.cached_cuda_graph_decode_query_start_loc_i32[: bs + 1])
+        else:
+            qsl_i32[: bs - num_padding].copy_(
+                self.cached_cuda_graph_decode_query_start_loc_i32[: bs - num_padding]
+            )
+            qsl_i32[bs - num_padding :].fill_(bs - num_padding)
+        self._decode_recurrent_shadow_i32 = (qsl_i32, idx_i32)
 
     def _capture_metadata(
         self,
@@ -89,7 +136,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
+            self._update_decode_recurrent_shadow_i32(bs, mamba_indices)
         elif forward_mode.is_target_verify():
+            self._decode_recurrent_shadow_i32 = None
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
@@ -163,7 +212,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     bs - num_padding
                 )
+            self._update_decode_recurrent_shadow_i32(bs, mamba_indices, num_padding)
         elif forward_mode.is_target_verify():
+            self._decode_recurrent_shadow_i32 = None
             ssm_state_indices = torch.arange(
                 bs * spec_info.draft_token_num,
                 dtype=torch.int32,

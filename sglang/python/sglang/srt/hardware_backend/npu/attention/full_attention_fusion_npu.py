@@ -1,16 +1,13 @@
 # Qwen3.5-35B-A3B NPU decode 全注意力段融合 kernel（full_attention 优化点 A1b/A2/A3a）。
 #
-# 内容与收益（图内 UT 实测，单层 decode 口径）：
 #   A1b split_qkvgate_v4_scatter：split q/gate/k/v + q/k gemma rmsnorm + rope
-#       单 kernel，且 k/v 按 loc 直接 scatter 进 KV cache（替代 stock
-#       split_qkvgate_gemma_rmsnorm_rope 13.5us + 2x npu_scatter_nd_update_ 29us，
-#       一体 5.32us）；返回的 k/v 为 None（cache 已写，调用方须跳过 set_kv_buffer）。
+#       单 kernel，且 k/v 按 loc 直接 scatter 进 KV cache；返回的 k/v 为 None
+#       （cache 已写，调用方须跳过 set_kv_buffer）。
 #   A2  fa_sigmoid_mul：sigmoid(gate)*attn 融合单 kernel（替代 sigmoid+mul_ 两
-#       kernel，3.34→2.29us）；bitwise 模式先舍 bf16 再乘，与 stock 逐位一致。
-#   A3a fa_add_gemma_rms_norm_v2：grid=(batch,) 行并行（stock 按核数开），
-#       5.30→4.01us；数学与 stock add_gemma_rms_norm 完全一致。
+#       kernel）；先舍 bf16 再乘，与 stock 双 op 舍入路径逐位一致。
+#   A3a fa_add_gemma_rms_norm_v2：grid=(batch,) 行并行；数学与 stock
+#       add_gemma_rms_norm 完全一致。
 #
-# 精度：三个 kernel 在图内 UT 均 bitwise=1.0（bf16 按 int16 逐位对比 stock）。
 # 数值约定与 sgl_kernel_npu stock 逐字一致：fp32 中间精度、gemma (w+1)、
 # neox rotate_half rope（cat=[-x2,x1]; out=cat*sin+rot*cos）。
 #
@@ -19,11 +16,10 @@
 # 判定在 capture 时烘进图，需在建图前设置）。
 #
 # 定位日志：SGLANG_NPU_FULL_ATTN_FUSION_DEBUG=1 时，A1b 守卫按层一次性打印
-# 「未命中原因」或「已激活」确认（服务器上确认 A1b 是否生效/卡在哪一环用）。
+# 「未命中原因」或「已激活」确认。
 #
-# ⚠️ triton-ascend 约束（GMM2 黑名单 + full_attention v2/v3 两轮实证）：
-# 不要按 program_id 做运行时段选择、不要用标量条件 mask store、不要 2D masked
-# store——v2/v3 均因此误编译。本文件全部 kernel 只用已实证构造子集：
+# ⚠️ triton-ascend 约束：不要按 program_id 做运行时段选择、不要用标量条件
+# mask store、不要 2D masked store（会误编译）。本文件全部 kernel 只用：
 # 纯线性索引 + 每 program 固定职责 + 1D 无掩码 store + constexpr if。
 
 import logging
@@ -59,7 +55,6 @@ def _fa_debug_log(key, msg):
 # ---------------------------------------------------------------------------
 # A3a：add_gemma_rms_norm 行并行版（grid=(batch,)，每 program 一整行）
 # 数学与 stock add_gemma_rms_norm 完全一致（bf16 加残差→fp32 归约→fp32 (w+1)）。
-# P1 已实证 bitwise=1.0、1.32x。
 # ---------------------------------------------------------------------------
 @triton.jit
 def add_gemma_rms_norm_v2_kernel(
@@ -85,8 +80,8 @@ def add_gemma_rms_norm_v2_kernel(
 
 
 def fa_add_gemma_rms_norm_v2_supported(x, residual) -> bool:
-    """A3a 形状守卫：2D、bf16、连续、hidden 为 2 的幂（UT 验证口径 [32,2048]，
-    kernel 对任意 batch 行数逐位等价；hidden 非 2 的幂时 tl.arange 不合法）。"""
+    """A3a 形状守卫：2D、bf16、连续、hidden 为 2 的幂
+    （hidden 非 2 的幂时 tl.arange 不合法）。"""
     if not fa_fusion_enabled():
         return False
     if residual is None or x.dim() != 2:
@@ -131,7 +126,7 @@ def sigmoid_mul_kernel(
     s = tl.sigmoid(g)
     if BITWISE:
         # 模拟 stock 两个 op 之间的 bf16 中间舍入：sigmoid 先舍到 bf16 再乘，
-        # 与 attn.mul_(torch.sigmoid(gate)) 目标逐位一致（P4 已实证 bitwise=1.0）。
+        # 与 attn.mul_(torch.sigmoid(gate)) 目标逐位一致。
         s = s.to(tl.bfloat16).to(tl.float32)
     out = (a * s).to(tl.bfloat16)
     tl.store(out_ptr + offs, out, mask=mask)
@@ -161,13 +156,14 @@ def fa_sigmoid_mul(attn, gate):
 
 
 # ---------------------------------------------------------------------------
-# A1b（v4，行并行直线版）：split q/kv/gate + q/k gemma rmsnorm + rope，
+# A1b（行并行直线版）：split q/kv/gate + q/k gemma rmsnorm + rope，
 # 且 k/v 按 loc 直接 scatter 进 KV cache（免中间张量与两次 scatter_nd_update）。
 # grid=(batch,)：一 program 一行，q+gate / k / v 三段在一条直线里顺序做完。
-# 设计约束（v2/v3 失败教训）：pid 只做线性索引（不取整除/取模）、段间无运行时
+# 设计约束（triton-ascend）：pid 只做线性索引（不取整除/取模）、段间无运行时
 # 选择、store 不带标量条件 mask；SCATTER_KV 为 constexpr 分支，本文件生产
 # wrapper 恒 =1，k/v 中间张量写出整段编译期消除。
-# TP8 shape 特化：NUM_Q_HEADS=2, NUM_KV_HEADS=1。
+# TP4/TP8/TP16 shape 特化：NUM_Q_HEADS∈{1,2,4}（TP16=1、TP8=2、9B-TP4=4，按
+# runtime shape 传入）, NUM_KV_HEADS=1。
 # ---------------------------------------------------------------------------
 @triton.jit
 def split_qkvgate_v4_kernel(
@@ -187,7 +183,7 @@ def split_qkvgate_v4_kernel(
     kv_hidden_size: tl.constexpr,
     total_hidden_size: tl.constexpr,
     eps: tl.constexpr,
-    NUM_Q_HEADS: tl.constexpr,  # 2
+    NUM_Q_HEADS: tl.constexpr,  # ∈{1,2,4}
     HEAD_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
     HALF_ROPE_DIM: tl.constexpr,
@@ -215,7 +211,7 @@ def split_qkvgate_v4_kernel(
     qvar = tl.sum(q * q, axis=1) / HEAD_DIM
     qn = q * tl.rsqrt(qvar + eps)[:, None] * qw[None, :]
 
-    # rope（neox rotate_half，仅前 ROPE_DIM 维；与 v3 已实证块逐字一致）
+    # rope（neox rotate_half，仅前 ROPE_DIM 维；运算顺序与 stock 逐字一致）
     sc = row * ROPE_DIM + tl.arange(0, ROPE_DIM)
     sin = tl.load(sin_ptr + sc).to(tl.float32).reshape(1, ROPE_DIM)
     cos = tl.load(cos_ptr + sc).to(tl.float32).reshape(1, ROPE_DIM)
@@ -240,8 +236,8 @@ def split_qkvgate_v4_kernel(
         qn, roped, offsets=(0, 0), sizes=(NUM_Q_HEADS, ROPE_DIM), strides=(1, 1)
     )
 
-    # q/gate 写出：1D 无掩码 store（stock reshape(Q_BLOCK) 同款；2D masked store
-    # 是 v3 的嫌疑构造，v4 全避开）
+    # q/gate 写出：1D 无掩码 store（stock reshape(Q_BLOCK) 同款；避开 2D
+    # masked store，见文件头 triton-ascend 约束）
     qg_out = row * q_hidden_size + tl.arange(0, NUM_Q_HEADS * HEAD_DIM)
     tl.store(
         q_ptr + qg_out,
@@ -277,8 +273,8 @@ def split_qkvgate_v4_kernel(
     # ---- v：bf16 原样拷贝（stock v 段不过 fp32）
     vt = tl.load(base + 2 * q_hidden_size + kv_hidden_size + d)
 
-    # constexpr 分支（A2 BITWISE 同族实证）：SCATTER_KV=1 时 k/v 中间张量写出
-    # 整段编译期消除，k_ptr/v_ptr 占位指针不会被解引用
+    # constexpr 分支：SCATTER_KV=1 时 k/v 中间张量写出整段编译期消除，
+    # k_ptr/v_ptr 占位指针不会被解引用
     if SCATTER_KV:
         slot = tl.load(loc_ptr + row).to(tl.int64)
         tl.store(
@@ -297,11 +293,14 @@ def split_qkvgate_v4_kernel(
 def fa_split_qkvgate_scatter_supported(
     num_heads, num_kv_heads, head_dim, rope_dim, attn_output_gate
 ) -> bool:
-    """A1b 形状守卫（TP 布局特化，UT 验证口径）：每 rank q=2 头、kv=1 头、
-    head_dim=256、rope=64、带 attn_output_gate。其余 TP/模型配置回退 stock。"""
+    """A1b 形状守卫（TP 布局特化）：每 rank q∈{1,2,4} 头
+    （TP16=1/TP8=2/9B-TP4=4）、kv=1 头、head_dim=256、rope=64、带 attn_output_gate。
+    其余 TP/模型配置回退 stock。
+    注：q=4（9B TP4 形态）放行后须先在服务器跑 bench_fa_graph.py --num-q 4
+    图内 UT 验证后才可投产。"""
     ok = (
         fa_fusion_enabled()
-        and num_heads == 2
+        and num_heads in (1, 2, 4)
         and num_kv_heads == 1
         and head_dim == 256
         and rope_dim == 64
@@ -311,7 +310,7 @@ def fa_split_qkvgate_scatter_supported(
         _fa_debug_log(
             ("shape_guard",),
             "A1b 形状守卫未命中（回退 stock）："
-            f"num_heads={num_heads}(需2) num_kv_heads={num_kv_heads}(需1) "
+            f"num_heads={num_heads}(需1/2/4) num_kv_heads={num_kv_heads}(需1) "
             f"head_dim={head_dim}(需256) rope_dim={rope_dim}(需64) "
             f"gate={attn_output_gate}(需True) "
             f"{_FA_FUSION_ENV}={os.environ.get(_FA_FUSION_ENV, '1')!r}",
@@ -364,7 +363,7 @@ def fa_v4_scatter_context(layer, forward_batch, qkv):
     返回 None（调用方回退 stock split + stock set_kv_buffer，行为与 origin
     完全一致）。DEBUG=1 时按层一次性打印未命中原因/激活确认。"""
     layer_id = layer.attn.layer_id
-    if not layer._fa_v4_shape_ok:
+    if not getattr(layer, "_fa_v4_shape_ok", False):
         _fa_debug_log(
             ("shape", layer_id),
             f"layer {layer_id}: _fa_v4_shape_ok=False（见 init 时形状守卫日志），"
@@ -424,12 +423,12 @@ def fa_split_qkvgate_scatter(
     k/v 不写中间张量、按 loc 直接 scatter 进 KV cache。
     返回 (q, None, None, gate)：k/v 为 None 表示 cache 已写，
     调用方须以 save_kv_cache=False 走 attention backend。
-    仅支持 q=2 头、kv=1 头（TP8 shape 特化），调用前须过
+    仅支持 q∈{1,2,4} 头、kv=1 头（TP16=1、TP8=2、9B-TP4=4 头特化），调用前须过
     fa_v4_scatter_context 守卫。"""
     batch = input.shape[0]
     num_q = q_hidden_size // head_dim
     num_kv = kv_hidden_size // head_dim
-    assert num_q == 2 and num_kv == 1, "v4 为 TP8 shape 特化（q=2 头, kv=1 头）"
+    assert num_q in (1, 2, 4) and num_kv == 1, "TP4/TP8/TP16 shape 特化（q∈{1,2,4} 头, kv=1 头）"
     assert kbuf.dtype == input.dtype and vbuf.dtype == input.dtype
     q_out = torch.empty(batch, q_hidden_size, device=input.device, dtype=input.dtype)
     gate_out = torch.empty(batch, q_hidden_size, device=input.device, dtype=input.dtype)
@@ -451,7 +450,7 @@ def fa_split_qkvgate_scatter(
         kv_hidden_size,
         q_hidden_size * 2 + kv_hidden_size * 2,
         eps,
-        NUM_Q_HEADS=2,
+        NUM_Q_HEADS=num_q,
         HEAD_DIM=head_dim,
         ROPE_DIM=rope_dim,
         HALF_ROPE_DIM=rope_dim // 2,

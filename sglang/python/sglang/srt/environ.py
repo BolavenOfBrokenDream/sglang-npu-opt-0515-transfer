@@ -526,6 +526,39 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # MoE expert weight L2 prefetch (decode aclgraph; see
+    # hardware_backend/npu/moe_weight_prefetch.py)
+    SGLANG_NPU_MOE_PREFETCH = EnvBool(False)
+    # Comma-separated op list: gmm1 (w13, default) / gmm2 (w2)
+    SGLANG_NPU_MOE_PREFETCH_OPS = EnvStr("gmm1")
+    # auto / full / active; auto == full, active falls back to full with warning
+    SGLANG_NPU_MOE_PREFETCH_MODE = EnvStr("auto")
+    SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB = EnvInt(16)
+    # Per-tensor capacity cap in MiB; 0 = auto (0.8 * queried L2 size)
+    SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB = EnvInt(0)
+    # full_attention decode 融合（A1b split+KV scatter / A2 sigmoid_mul /
+    # A3a add_gemma_rms_norm，hardware_backend/npu/attention/
+    # full_attention_fusion_npu.py）总开关，默认开；DEBUG=1 按层打印守卫未命中原因
+    SGLANG_NPU_FULL_ATTN_FUSION = EnvBool(True)
+    SGLANG_NPU_FULL_ATTN_FUSION_DEBUG = EnvBool(False)
+    # TP 线 AscendC 融合总开关（默认关，仅 op1 fused_qkvzba_conv1d 跟随）；
+    # QKVZBA 为 op1 分开关（未设置随总开关，显式 0 单关）；
+    # GDN_RECURRENT_ASCENDC 为 op2 recurrent 开关（默认关，import 期判定，
+    # 须在建图/服务启动前设置）；DEBUG=1 打印守卫未命中原因
+    SGLANG_NPU_TP_ASCENDC_FUSION = EnvBool(False)
+    SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA = EnvBool(False)
+    SGLANG_NPU_GDN_RECURRENT_ASCENDC = EnvBool(False)
+    SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG = EnvBool(False)
+    # GDN decode recurrent PR#740 优化 Triton 版开关（默认关）
+    SGLANG_NPU_GDN_UPDATE_FUSED = EnvBool(False)
+    # GDN 输入投影 qkvz+ba 权重打包单 GEMM（默认开）；MAX_M 为小 M 门控，
+    # M 超过阈值回退两次 GEMM
+    SGLANG_NPU_GDN_QKVZBA_PACK = EnvBool(True)
+    SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M = EnvInt(256)
+    # post_sample：异步 exponential-race 采样（910C 限定，默认关）；
+    # EXP_RACE_TRITON 为其融合 Triton 消费 kernel 开关（默认开）
+    SGLANG_NPU_ASYNC_EXPONENTIAL = EnvBool(False)
+    SGLANG_NPU_EXP_RACE_TRITON = EnvBool(True)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # MoE 前段融合包（moe_front_fusion/v1，合入自 daikang 分支）总开关：
     # renorm=1 单算子路由 + v2.2 自写 init_routing，仅作用于无 group/无 bias

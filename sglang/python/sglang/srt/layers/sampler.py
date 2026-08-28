@@ -58,6 +58,25 @@ _disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAM
 if is_npu():
     import torch_npu
 
+
+def _is_ascend_910c() -> bool:
+    """Return whether the current NPU is an Ascend 910C-series chip.
+
+    torch.npu.get_device_name() reports names like "Ascend910_9382" on 910C.
+    The async exponential-race path relies on uniform_() decomposing to
+    DSARandomUniform on the DSA_SQE core, which only exists on the 910C
+    series; other NPUs route uniform_() to AIV/AICore RNG kernels that would
+    contend with the model forward. Fail closed on any query error so
+    sampling stays on the stock torch.multinomial path.
+    """
+    if not is_npu():
+        return False
+    try:
+        return torch.npu.get_device_name().startswith("Ascend910_93")
+    except Exception:
+        return False
+
+
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
@@ -91,15 +110,93 @@ class Sampler(nn.Module):
         # even when it overlaps the next forward (v1 ran the full exponential_()
         # chain here and its AIV tail contended with forward).
         # This is opt-in because it changes the random-number sequence, although it
-        # preserves the categorical sampling distribution.
-        self.enable_async_exponential = is_npu() and get_bool_env_var(
+        # preserves the categorical sampling distribution. The gate is
+        # additionally restricted to the Ascend 910C series: the side stream is
+        # AIV-free only if uniform_() runs on the DSA_SQE core (910C-only).
+        # On any other device the flag stays off and every batch falls back to
+        # the stock torch.multinomial path.
+        async_exponential_requested = is_npu() and get_bool_env_var(
             "SGLANG_NPU_ASYNC_EXPONENTIAL"
         )
+        self.enable_async_exponential = (
+            async_exponential_requested and _is_ascend_910c()
+        )
+        if async_exponential_requested and not self.enable_async_exponential:
+            logger.warning(
+                "SGLANG_NPU_ASYNC_EXPONENTIAL is set but the current device is "
+                "not an Ascend 910C series NPU; async exponential-race sampling "
+                "is disabled, falling back to torch.multinomial"
+            )
         self._async_exponential_stream = None
         self._async_exponential_event = None
         self._async_exponential_u = None
         self._async_exponential_pending = False
         self._async_exp_min_bound = None
+
+        # Optional fused Triton consumption kernel, replacing the multi-pass
+        # stock-exponential transform + RealDiv + ArgMaxV2 chain with one
+        # kernel that reads probs and u once. Same math, same torch.argmax
+        # first-occurrence tie-breaking. Fail-closed: any import/compile/smoke
+        # failure keeps the unfused chain.
+        self._exp_race_fused = None
+        if self.enable_async_exponential and get_bool_env_var(
+            "SGLANG_NPU_EXP_RACE_TRITON", "true"
+        ):
+            self._exp_race_fused = self._init_exp_race_fused()
+
+    @staticmethod
+    def _init_exp_race_fused():
+        """Resolve the fused kernel and smoke-test it against the unfused chain.
+
+        The smoke shape (4, 10000) deliberately exceeds BLOCK_V=4096 so the
+        masked tail path is exercised, and plants boundary u values (0 and
+        1-2^-24, the exact cap grid points) plus an exact score tie to check
+        first-occurrence tie-breaking. Any exception or mismatch disables the
+        fused path (fail-closed).
+        """
+        try:
+            from sglang.srt.layers.exp_race_fused_triton import exp_race_argmax
+
+            device = torch.device("npu")
+            u = torch.rand((4, 10000), dtype=torch.float32, device=device)
+            u[0, 0] = 0.0
+            u[1, 0] = 1.0 - 2.0**-24
+            probs = torch.rand((4, 10000), dtype=torch.float32, device=device)
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+            # Exact score tie at the maximal score: identical (p, u) pair at
+            # two columns with u=0; the lower index must win, matching
+            # torch.argmax.
+            u[:, 50] = 0.0
+            u[:, 60] = 0.0
+            probs[:, 50] = 0.5
+            probs[:, 60] = 0.5
+            fused = exp_race_argmax(probs, u)
+            q = u.neg_().add_(1.0)
+            bound = torch.full(
+                (),
+                1.0 - torch.finfo(torch.float32).eps / 2.0,
+                dtype=torch.float32,
+                device=device,
+            )
+            torch.minimum(q, bound, out=q)
+            q.log_().neg_()
+            reference = torch.div(probs, q).argmax(dim=-1).view(-1).to(torch.int32)
+            if not torch.equal(fused, reference):
+                raise RuntimeError(
+                    f"fused exp-race smoke test mismatch: {fused} vs {reference}"
+                )
+            logger.info(
+                "Enabled fused Triton exp-race consumption kernel "
+                "(SGLANG_NPU_EXP_RACE_TRITON)"
+            )
+            return exp_race_argmax
+        except Exception as e:
+            logger.warning(
+                "Fused Triton exp-race kernel unavailable (%s); falling back "
+                "to the unfused stock-exponential chain",
+                e,
+            )
+            return None
 
     def can_prepare_async_exponential(
         self, sampling_info: SamplingBatchInfo
@@ -231,6 +328,11 @@ class Sampler(nn.Module):
         # inf/NaN edge.
         # All transform ops run here on the main stream; the side stream stays
         # pure DSA uniform with zero AIV kernels.
+        if self._exp_race_fused is not None:
+            # Same math as the chain below in one Triton kernel (single pass
+            # over probs and u). Non-destructive on u; returns int32 [B].
+            return self._exp_race_fused(probs, u)
+
         bound = self._async_exp_min_bound
         if bound is None or bound.dtype != u.dtype or bound.device != u.device:
             bound = torch.full(
@@ -345,7 +447,12 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
+                # All temperature == 1.0 makes div_ an IEEE bitwise identity
+                # (x/1.0 == x), so skip the RealDiv. The flag is maintained
+                # host-side by SamplingBatchInfo; older versions without the
+                # field default to False (no skip) via getattr.
+                if not getattr(sampling_info, "temperatures_all_one", False):
+                    logits.div_(sampling_info.temperatures)
 
                 # Do not write the softmax output back into logits: the
                 # write-back costs a full-matrix TensorMove pass (~0.2 ms on

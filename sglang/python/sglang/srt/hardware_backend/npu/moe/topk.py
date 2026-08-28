@@ -42,11 +42,13 @@ def fused_topk_npu(
             and renormalize
             and topk_config.num_fused_shared_experts == 0
         ):
-            # renorm=1 单算子 = gating_top_k_softmax + l1_norm（daikang 六轮单测：
-            # ids 与 stock 链逐位一致含构造并列对抗、weights 差 ≤3e-8，
-            # 链路口径 -10.2µs/层；输入 fp32 化与对拍链口径一致）。
+            # renorm=1 单算子 = gating_top_k_softmax + l1_norm。
+            # bf16 直喂：aclnnMoeGatingTopK 契约支持 BF16 输入，kernel 内精确扩张后
+            # softmax 全程 fp32 计算，ids 逐位不变；出口不再 fp32 化（bf16 输出下
+            # 该 .to(fp32) 会变成真 cast）。deepep 线 topk_weights 的 fp32 契约由
+            # deepep.py 两处 dispatch_a 前的防御性 .to(fp32) 恢复。
             topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-                router_logits.to(torch.float32),
+                router_logits,
                 k=topk_config.top_k,
                 bias=None,
                 k_group=1,
@@ -57,7 +59,6 @@ def fused_topk_npu(
                 routed_scaling_factor=1.0,
                 eps=float(1e-20),
             )
-            topk_weights = topk_weights.to(torch.float32)
         else:
             topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
                 router_logits,

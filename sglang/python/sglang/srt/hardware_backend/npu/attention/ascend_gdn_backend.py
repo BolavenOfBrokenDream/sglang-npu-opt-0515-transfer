@@ -5,7 +5,16 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_kernel_without_sigmoid,
     fused_gdn_gating_npu,
 )
+from sgl_kernel_npu.fla.utils import (
+    fused_qkvzba_split_reshape_cat_contiguous,
+)
 
+from sglang.srt.hardware_backend.npu.tp_ascendc_fusion_npu import (
+    tp_debug_log,
+    tp_fused_qkvzba_conv1d_inputs_ok,
+    tp_fusion_qkvzba_enabled,
+    tp_op_available,
+)
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
@@ -93,6 +102,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
             return
+        # eager（非图）前向的 metadata 由基类现建 int32，recurrent 无 cast 问题——
+        # 清掉图流程遗留的 int32 影子，避免误用旧 buffer。
+        self._decode_recurrent_shadow_i32 = None
         super().init_forward_metadata(forward_batch)
         self.prepare_gdn_inputs(
             forward_batch.batch_size,
@@ -123,19 +135,90 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        # recurrent 侧改用 int32 影子 buffer（decode 图流程由 _capture/_replay_metadata
+        # 图外同步，内容与 int64 主 buffer 一致）；影子为 None（eager/verify）时沿用
+        # 原 metadata。conv 侧仍用 int64 主 buffer。
+        recurrent_query_start_loc = query_start_loc
+        recurrent_cache_indices = cache_indices
+        if self._decode_recurrent_shadow_i32 is not None:
+            recurrent_query_start_loc, recurrent_cache_indices = (
+                self._decode_recurrent_shadow_i32
+            )
 
-        assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = torch.ops.npu.causal_conv1d(
-            mixed_qkv,
-            self._get_conv_weights_t(layer),
-            conv_states=conv_states,
-            bias=layer.bias,
-            query_start_loc=query_start_loc,
-            cache_indices=cache_indices,
-            activation_mode=1,
-            pad_slot_id=-1,
-            run_mode=1,
-        )
+        # qwen3_5.py 侧守卫命中后以 tuple 传入原始投影
+        # (projected_states_qkvz, projected_states_ba)（未经 split）——split +
+        # causal_conv1d(run_mode=1) 由 torch.ops.npu.fused_qkvzba_conv1d 单 kernel
+        # 完成（conv_states 原地更新语义不变），z 随 (core_attn_out, z) 回流给模型侧。
+        # 运行期判定不通过（算子未注册/张量属性不符）→ 本地跑原 split kernel 再走
+        # stock conv，同样以 tuple 返回，调用侧无感（静默回退，capture 时分支烘进图）。
+        fused_z = None
+        if isinstance(mixed_qkv, tuple):
+            qkvz, mixed_ba = mixed_qkv
+            if tp_fusion_qkvzba_enabled() and tp_op_available(
+                "fused_qkvzba_conv1d"
+            ) and tp_fused_qkvzba_conv1d_inputs_ok(
+                qkvz,
+                mixed_ba,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            ):
+                mixed_qkv, fused_z, b, a = torch.ops.npu.fused_qkvzba_conv1d(
+                    qkvz,
+                    self._get_conv_weights_t(layer),
+                    conv_states,
+                    mixed_ba,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                    bias=layer.bias,
+                    query_start_loc=query_start_loc,
+                    cache_indices=cache_indices,
+                    activation_mode=1,
+                    pad_slot_id=-1,
+                )
+            else:
+                tp_debug_log(
+                    ("qkvzba_rt", layer.layer_id),
+                    f"layer {layer.layer_id}: fused_qkvzba_conv1d 运行期判定未命中"
+                    f"（enabled={tp_fusion_qkvzba_enabled()} "
+                    f"op={tp_op_available('fused_qkvzba_conv1d')}），"
+                    "本地 split+stock conv 回退",
+                )
+                mixed_qkv, fused_z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                    qkvz,
+                    mixed_ba,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    layer.head_k_dim,
+                    layer.head_v_dim,
+                )
+                mixed_qkv = torch.ops.npu.causal_conv1d(
+                    mixed_qkv,
+                    self._get_conv_weights_t(layer),
+                    conv_states=conv_states,
+                    bias=layer.bias,
+                    query_start_loc=query_start_loc,
+                    cache_indices=cache_indices,
+                    activation_mode=1,
+                    pad_slot_id=-1,
+                    run_mode=1,
+                )
+        else:
+            assert isinstance(mixed_qkv, torch.Tensor)
+            mixed_qkv = torch.ops.npu.causal_conv1d(
+                mixed_qkv,
+                self._get_conv_weights_t(layer),
+                conv_states=conv_states,
+                bias=layer.bias,
+                query_start_loc=query_start_loc,
+                cache_indices=cache_indices,
+                activation_mode=1,
+                pad_slot_id=-1,
+                run_mode=1,
+            )
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -156,13 +239,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
+            cache_indices=recurrent_cache_indices,
+            query_start_loc=recurrent_query_start_loc,
         )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
         )
+        # tuple 输入路径以 (core_attn_out, z) 回流（与 qwen3_5.py 侧解包约定自洽）；
+        # tensor 路径返回值与 stock 完全一致。
+        if fused_z is not None:
+            return core_attn_out, fused_z
         return core_attn_out
 
     def forward_extend(

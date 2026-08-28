@@ -75,7 +75,12 @@ def chunk_local_cumsum_scalar_kernel(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
+    # Keep key at 6 entries: triton-ascend's AutoTilingTuner (which replaces
+    # triton.autotune after the first Triton compile in the process) rejects
+    # longer key lists at decoration time, crashing engine boot if this module
+    # is imported late. The key only controls autotune cache granularity; the
+    # tuned configs are unchanged.
+    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(
