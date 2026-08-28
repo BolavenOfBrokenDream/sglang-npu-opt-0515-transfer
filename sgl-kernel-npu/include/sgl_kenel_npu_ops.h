@@ -1,0 +1,177 @@
+// Licensed under the BSD 3-Clause License  (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef SGL_KERNEL_NPU_OPS_H
+#define SGL_KERNEL_NPU_OPS_H
+
+namespace sglang {
+namespace npu_kernel {
+at::Tensor helloworld(const at::Tensor &x, const at::Tensor &y);
+
+at::Tensor cache_loc_assign(const at::Tensor &req_indices,
+                            const at::Tensor &token_pool,
+                            const at::Tensor &start_offset,
+                            const at::Tensor &end_offset,
+                            const at::Tensor &out_cache_loc,
+                            int64_t max_step);
+
+at::Tensor cache_loc_update(const at::Tensor &req_indices,
+                            const at::Tensor &token_pool,
+                            const at::Tensor &start_offset,
+                            const at::Tensor &end_offset,
+                            const at::Tensor &out_cache_loc,
+                            int64_t max_step);
+
+bool assign_cache_op(at::Tensor &dst_tensor, const at::Tensor &src_tensor,
+                     const at::Tensor &dst_start_idx,
+                     const at::Tensor &dst_end_idx,
+                     const at::Tensor &src_start_idx,
+                     const at::Tensor &src_end_idx);
+
+void alloc_extend(const at::Tensor &pre_lens, const at::Tensor &seq_lens,
+                  const at::Tensor &last_loc, const at::Tensor &free_pages,
+                  int64_t pages_size, at::Tensor &out_indices,
+                  at::Tensor &values);
+
+void build_tree_efficient(
+    const at::Tensor &parent_list, const at::Tensor &selected_index,
+    const at::Tensor &verified_seq_len, const at::Tensor &tree_mask,
+    const at::Tensor &positions, const at::Tensor &retrive_index,
+    const at::Tensor &retrive_next_token,
+    const at::Tensor &retrive_next_sibling, int64_t topk, int64_t depth,
+    int64_t draft_token_num, int64_t tree_mask_mode);
+
+std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
+mla_preprocess(const at::Tensor &hiddenState, const at::Tensor &gamma0,
+               const at::Tensor &beta0, const at::Tensor &wdqkv,
+               const at::Tensor &descale0, const at::Tensor &gamma1,
+               const at::Tensor &beta1, const at::Tensor &wuq,
+               const at::Tensor &descale1, const at::Tensor &gamma2,
+               const at::Tensor &cos, const at::Tensor &sin,
+               const at::Tensor &wuk, const at::Tensor &kv_cache,
+               const at::Tensor &kv_cache_rope, const at::Tensor &slotmapping,
+               const at::Tensor &quant_scale0, const at::Tensor &quant_offset0,
+               const at::Tensor &bias0, const at::Tensor &quant_scale1,
+               const at::Tensor &quant_offset1, const at::Tensor &bias1,
+               const c10::optional<at::Tensor> &ctkv_scale,
+               const c10::optional<at::Tensor> &q_nope_scale,
+               c10::optional<c10::string_view> cache_mode,
+               c10::optional<c10::string_view> quant_mode, at::Tensor &q_out0,
+               at::Tensor &kv_cache_out0, at::Tensor &q_out1,
+               at::Tensor &kv_cache_out1);
+
+void batch_matmul_transpose(const at::Tensor &tensor_a,
+                            const at::Tensor &tensor_b, at::Tensor &tensor_c,
+                            c10::optional<c10::string_view> format_mode,
+                            c10::optional<c10::string_view> quant_mode);
+
+void transfer_kv_dim_exchange(at::Tensor &device_k, at::Tensor &host_k,
+                              at::Tensor &device_v, at::Tensor &host_v,
+                              const at::Tensor &device_indices,
+                              const at::Tensor &host_indices, int64_t page_size,
+                              int64_t direction, int64_t flags);
+
+at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices,
+                       at::Tensor &y, int64_t slice_offset, int64_t slice_size);
+
+void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices,
+                 at::Tensor &y, double scale);
+
+at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight,
+                       at::Tensor &lora_indices, at::Tensor &seq_len,
+                       at::Tensor &y, int64_t slice_offset, int64_t slice_size);
+
+void sgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices,
+                 at::Tensor &seq_len, at::Tensor &y, double scale);
+
+at::Tensor sgemmv_expand(at::Tensor &x, at::Tensor &weight,
+                         at::Tensor &lora_indices, at::Tensor &seq_len,
+                         at::Tensor &lora_ranks, at::Tensor &slice_offsets,
+                         at::Tensor &y);
+
+void sgemmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices,
+                   at::Tensor &seq_len, at::Tensor &lora_ranks,
+                   at::Tensor &lora_scales, at::Tensor &y);
+
+at::Tensor recurrent_gated_delta_rule(
+    at::Tensor &mix_qkv, at::Tensor &recurrent_state, at::Tensor &beta,
+    double scale, at::Tensor &actual_seq_lengths, at::Tensor &ssm_state_indices,
+    int64_t nk, int64_t nv, c10::optional<at::Tensor> intermediate_state_opt,
+    c10::optional<at::Tensor> cache_indices_opt,
+    c10::optional<at::Tensor> num_accepted_tokens_opt,
+    c10::optional<at::Tensor> g_opt, c10::optional<at::Tensor> gk_opt);
+
+at::Tensor sgemmc_expand(at::Tensor &x, at::Tensor &weight,
+                         at::Tensor &lora_indices, at::Tensor &seq_len,
+                         at::Tensor &lora_ranks, at::Tensor &slice_offsets,
+                         at::Tensor &y);
+
+void sgemmc_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices,
+                   at::Tensor &seq_len, at::Tensor &lora_ranks,
+                   at::Tensor &lora_scales, at::Tensor &y, int64_t slice_count);
+
+#ifdef BUILD_CATLASS_MODULE
+void catlass_matmul_basic(const at::Tensor &tensor_a,
+                          const at::Tensor &tensor_b, at::Tensor &tensor_c,
+                          c10::optional<c10::string_view> format_mode);
+
+at::Tensor softfp8_w8a16_grouped_matmul(const at::Tensor &mat1,
+                                        const at::Tensor &mat2,
+                                        const at::Tensor &scale,
+                                        const at::Tensor &groupList,
+                                        const std::string &outDType);
+
+at::Tensor softfp8_w8a16_matmul(const at::Tensor &mat1, const at::Tensor &mat2,
+                                const at::Tensor &scale,
+                                const std::string &outDType);
+#endif
+
+void mega_chunk_gdn(
+    const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+    const at::Tensor &g, const at::Tensor &beta, const at::Tensor &mask_lower,
+    const at::Tensor &mask_full, const at::Tensor &minus_identity,
+    const at::Tensor &cu_seqlens, at::Tensor &out, at::Tensor &g_sum,
+    at::Tensor &g_t, at::Tensor &beta_t, at::Tensor &a, at::Tensor &a_inv_f32,
+    at::Tensor &a_inv, at::Tensor &w, at::Tensor &u, at::Tensor &s,
+    at::Tensor &v_new, at::Tensor &final_state, const at::Tensor &initial_state,
+    bool has_initial_state, at::Tensor &kkt_workspace,
+    at::Tensor &wy_workspace_a1, at::Tensor &wy_workspace_a2,
+    at::Tensor &h_workspace, at::Tensor &o_workspace_qk,
+    at::Tensor &o_workspace_qs, at::Tensor &o_workspace_gated,
+    int64_t block_dim, int64_t batch_size, int64_t seq_len,
+    int64_t total_tokens, int64_t num_matrices);
+
+at::Tensor lightning_indexer(
+    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
+    const c10::optional<at::Tensor> &actual_seq_lengths_query,
+    const c10::optional<at::Tensor> &actual_seq_lengths_key,
+    const c10::optional<at::Tensor> &block_table,
+    c10::optional<c10::string_view> layout_query,
+    c10::optional<c10::string_view> layout_key,
+    c10::optional<int64_t> sparse_count, c10::optional<int64_t> sparse_mode);
+
+/**
+ * @brief Triangular inverse of input tensor where last two dimensions represent
+ * a matrix.
+ *
+ * @param [in] tensor_in Tensor of dimensions (..., n, n) where `n` is
+ * the matrix size.
+ * @return at::Tensor Returns tensor of same shape where each matrix of size n
+ * is inversed.
+ */
+at::Tensor tri_inv_col_sweep(const at::Tensor &tensor_in);
+at::Tensor apply_token_bitmask(at::Tensor logits, at::Tensor bitmask,
+                               c10::optional<at::Tensor> indices);
+
+} // namespace npu_kernel
+
+} // namespace sglang
+
+#endif // SGL_KERNEL_NPU_OPS_H
