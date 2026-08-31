@@ -115,10 +115,16 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self.graph_mode = False
 
     def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
+        # layer.conv_weights 是 conv1d.weight 的 view，与其共享 autograd version
+        # counter；在线权重更新（update_weights_from_tensor → load_weights）走
+        # 原地 copy_，会递增该版本号。缓存必须随版本失效，否则首次 rollout 后
+        # 再更新权重时会继续用旧的转置副本，形成新旧权重混合。
         w = getattr(layer, "_conv_weights_t", None)
-        if w is None:
+        version = layer.conv_weights._version
+        if w is None or version != getattr(layer, "_conv_weights_t_version", None):
             w = layer.conv_weights.transpose(0, 1).contiguous()
             layer._conv_weights_t = w
+            layer._conv_weights_t_version = version
         return w
 
     def forward_decode(
