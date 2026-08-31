@@ -1,6 +1,7 @@
-// fused_sigmoid_gating_recurrent bf16 入口（pool bf16，生产臂）。
-// 一 kernel 一文件——KERNEL_TASK_TYPE_DEFAULT 与单文件多 kernel 不共存（仅首个注册
-// 成功，其余 RegisterAscendBinary ret 107000；见 lib 头注释的结构约束说明）。
+// fused_sigmoid_gating_recurrent bf16 entry (bf16 pool, production arm).
+// One kernel per file: KERNEL_TASK_TYPE_DEFAULT does not coexist with multiple
+// kernels in one file (only the first registers; the rest fail with
+// RegisterAscendBinary ret 107000 — see the structural constraint in the lib header).
 
 #include "fused_sigmoid_gating_recurrent_kernel_lib.h"
 

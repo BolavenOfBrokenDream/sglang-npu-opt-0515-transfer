@@ -102,8 +102,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
             return
-        # eager（非图）前向的 metadata 由基类现建 int32，recurrent 无 cast 问题——
-        # 清掉图流程遗留的 int32 影子，避免误用旧 buffer。
+        # In eager (non-graph) forward the base class builds int32 metadata, so
+        # no cast is needed for recurrent — drop any graph-flow int32 shadow to
+        # avoid reusing a stale buffer.
         self._decode_recurrent_shadow_i32 = None
         super().init_forward_metadata(forward_batch)
         self.prepare_gdn_inputs(
@@ -115,10 +116,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self.graph_mode = False
 
     def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
-        # layer.conv_weights 是 conv1d.weight 的 view，与其共享 autograd version
-        # counter；在线权重更新（update_weights_from_tensor → load_weights）走
-        # 原地 copy_，会递增该版本号。缓存必须随版本失效，否则首次 rollout 后
-        # 再更新权重时会继续用旧的转置副本，形成新旧权重混合。
+        # layer.conv_weights is a view of conv1d.weight and shares its autograd
+        # version counter; online weight updates (update_weights_from_tensor →
+        # load_weights) use in-place copy_, which bumps that version. The cache
+        # must be invalidated with the version, otherwise a stale transposed
+        # copy survives later weight updates and mixes old/new weights.
         w = getattr(layer, "_conv_weights_t", None)
         version = layer.conv_weights._version
         if w is None or version != getattr(layer, "_conv_weights_t_version", None):
@@ -141,9 +143,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
-        # recurrent 侧改用 int32 影子 buffer（decode 图流程由 _capture/_replay_metadata
-        # 图外同步，内容与 int64 主 buffer 一致）；影子为 None（eager/verify）时沿用
-        # 原 metadata。conv 侧仍用 int64 主 buffer。
+        # Recurrent side uses int32 shadow buffers (synced outside the decode
+        # graph by _capture/_replay_metadata, identical in content to the int64
+        # primary buffers); when the shadow is None (eager/verify) the original
+        # metadata is used. The conv side keeps the int64 primary buffers.
         recurrent_query_start_loc = query_start_loc
         recurrent_cache_indices = cache_indices
         if self._decode_recurrent_shadow_i32 is not None:
@@ -151,12 +154,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 self._decode_recurrent_shadow_i32
             )
 
-        # qwen3_5.py 侧守卫命中后以 tuple 传入原始投影
-        # (projected_states_qkvz, projected_states_ba)（未经 split）——split +
-        # causal_conv1d(run_mode=1) 由 torch.ops.npu.fused_qkvzba_conv1d 单 kernel
-        # 完成（conv_states 原地更新语义不变），z 随 (core_attn_out, z) 回流给模型侧。
-        # 运行期判定不通过（算子未注册/张量属性不符）→ 本地跑原 split kernel 再走
-        # stock conv，同样以 tuple 返回，调用侧无感（静默回退，capture 时分支烘进图）。
+        # When the qwen3_5.py guard hits, the raw projections arrive as a tuple
+        # (projected_states_qkvz, projected_states_ba) before split — split +
+        # causal_conv1d(run_mode=1) are done by the single kernel
+        # torch.ops.npu.fused_qkvzba_conv1d (conv_states in-place semantics
+        # unchanged), and z flows back to the model side as (core_attn_out, z).
+        # If the runtime check fails (op unregistered / tensor attrs mismatch),
+        # fall back to the local split kernel + stock conv, still returning a
+        # tuple so the caller is unaffected (silent fallback; the branch is
+        # baked into the graph at capture time).
         fused_z = None
         if isinstance(mixed_qkv, tuple):
             qkvz, mixed_ba = mixed_qkv
@@ -188,10 +194,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             else:
                 tp_debug_log(
                     ("qkvzba_rt", layer.layer_id),
-                    f"layer {layer.layer_id}: fused_qkvzba_conv1d 运行期判定未命中"
-                    f"（enabled={tp_fusion_qkvzba_enabled()} "
-                    f"op={tp_op_available('fused_qkvzba_conv1d')}），"
-                    "本地 split+stock conv 回退",
+                    f"layer {layer.layer_id}: fused_qkvzba_conv1d runtime check "
+                    f"missed (enabled={tp_fusion_qkvzba_enabled()} "
+                    f"op={tp_op_available('fused_qkvzba_conv1d')}), "
+                    "falling back to local split + stock conv",
                 )
                 mixed_qkv, fused_z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                     qkvz,
@@ -252,8 +258,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
         )
-        # tuple 输入路径以 (core_attn_out, z) 回流（与 qwen3_5.py 侧解包约定自洽）；
-        # tensor 路径返回值与 stock 完全一致。
+        # Tuple-input path returns (core_attn_out, z) to match the qwen3_5.py
+        # unpacking convention; the tensor path return matches stock exactly.
         if fused_z is not None:
             return core_attn_out, fused_z
         return core_attn_out

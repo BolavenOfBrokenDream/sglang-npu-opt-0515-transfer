@@ -150,16 +150,18 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor? num_accepted_tokens=None, int activation_mode=0, int pad_slot_id=-1, "
         "int run_mode=0) -> Tensor");
 
-    // GDN decode split + causal_conv1d 单 kernel
+    // GDN decode split + causal_conv1d in a single kernel
     m.def(
         "fused_qkvzba_conv1d(Tensor qkvz, Tensor weight, Tensor conv_states, Tensor mixed_ba, "
         "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, Tensor? bias=None, "
         "Tensor? query_start_loc=None, Tensor? cache_indices=None, int activation_mode=0, "
         "int pad_slot_id=-1) -> (Tensor, Tensor, Tensor, Tensor)");
 
-    // GDN decode recurrent（sigmoid gating + delta rule update）的 AscendC AIV 版，
-    // 仅 decode（T==N，每序列 1 token）；initial_state_source 为 ssm state pool、
-    // 原地更新；q/k/v 允许末维连续的 strided 视图（行 stride 显式传入）。
+    // AscendC AIV version of the GDN decode recurrent (sigmoid gating + delta
+    // rule update), decode only (T==N, one token per sequence);
+    // initial_state_source is the ssm state pool and is updated in place;
+    // q/k/v may be strided views with a contiguous last dim (row strides are
+    // passed explicitly).
     m.def(
         "fused_sigmoid_gating_recurrent(Tensor A_log, Tensor a, Tensor dt_bias, "
         "float softplus_beta, float softplus_threshold, "

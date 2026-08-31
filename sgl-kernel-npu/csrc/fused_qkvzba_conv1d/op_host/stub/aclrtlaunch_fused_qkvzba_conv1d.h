@@ -1,4 +1,4 @@
-// fused_qkvzba_conv1d 的 aclrtlaunch 声明（照 causal_conv1d 的 stub 约定手写）
+// aclrtlaunch declaration for fused_qkvzba_conv1d (handwritten per the causal_conv1d stub convention)
 #ifndef HEADER_ACLRTLAUNCH_CUSTOM_FUSED_QKVZBA_CONV1D_H
 #define HEADER_ACLRTLAUNCH_CUSTOM_FUSED_QKVZBA_CONV1D_H
 #include "acl/acl_base.h"

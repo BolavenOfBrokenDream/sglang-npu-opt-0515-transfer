@@ -1,23 +1,28 @@
 """MoE expert weight L2 prefetch for NPU decode (aclgraph replay).
 
-形态：
-- **自目标单发射点 = 本层 prepare_attn 完成后、attention 开始前**：
-  在该点发射**本层**的权重预取。EP 线的层间通信（reduceScatter + allGather）
-  在下一层 prepare_attn 内完成、TP 线的层尾 all_reduce 在上一层
-  postprocess_layer 内完成——该点在两条线下都位于**全部层间通信之后**，
-  不与通信争带宽；自目标使 layer 0 也获得 attention 窗口。
-- GMM1(w13) 全量预取：发射 w13(j)，仅 GDN 层；默认开。
-- GMM2(w2) 全量预取：**并入同一发射点**，w2(j) 块序列接在 w13(j) 之后
-  （消费序：w2 的消费截止于 GMM2(j)，比 w13 晚一个 GMM1+SwiGLU）；默认关。
-  合并发射门控：w13+w2 ≤ 0.8×L2。
-- best-effort：GMM 前主流不 wait CMO 流（cache 预热无 RAW 冒险），step 末
-  drain（防跨 step 积压 + 侧流经 event 返回主流的 capture 合法性要求）。
-- 仅 graph capture 期发射（eager / prefill 不激活）；CMO 是 SDMA 任务，
-  不占 AIV/AIC 核。
-- 仅注册过目标模型的层对象会触发发射（`_moe_prefetch_emit` 标记），
-  MTP draft 模型的层即使在同名文件内复用本 forward 也不会误发射。
+Design:
+- Self-targeted single launch point: after this layer's prepare_attn, before
+  attention starts; the layer's own weight prefetch is launched there. EP
+  inter-layer communication (reduceScatter + allGather) completes inside the next
+  layer's prepare_attn, and TP's layer-end all_reduce inside the previous layer's
+  postprocess_layer — so this point sits after all inter-layer communication on
+  both paths and does not contend with it for bandwidth; self-targeting also gives
+  layer 0 an attention window.
+- GMM1 (w13) full prefetch: launches w13(j), GDN layers only; on by default.
+- GMM2 (w2) full prefetch: merged into the same launch point, w2(j) chunks appended
+  after w13(j) (consumption order: w2 is consumed by GMM2(j), one GMM1+SwiGLU later
+  than w13); off by default. Merged-launch gate: w13+w2 <= 0.8*L2.
+- Best-effort: the main stream does not wait for the CMO stream before GMM (cache
+  warm-up has no RAW hazard); drained at step end (prevents cross-step backlog, and
+  capture legality requires the side stream to return to the main stream via event).
+- Launched only during graph capture (eager / prefill never activate); CMO is an
+  SDMA task and occupies no AIV/AIC cores.
+- Only layer objects registered for the target model trigger launches
+  (`_moe_prefetch_emit` marker); layers of the MTP draft model never launch even if
+  they reuse this forward from the same file.
 
-注意：torch_npu 一律在函数内惰性 import，保证本模块在 CUDA 等其他平台可安全 import。
+Note: torch_npu is always lazily imported inside functions, so this module is safe
+to import on CUDA and other platforms.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ _VALID_MODES = ("auto", "full", "active")
 
 
 # ---------------------------------------------------------------------------
-# L2 容量查询（ctypes，免编译）
+# L2 capacity query (ctypes, no compilation needed)
 # ---------------------------------------------------------------------------
 def _dlopen_first(candidates):
     for path in candidates:
@@ -70,7 +75,7 @@ def _try_get_info(lib, func_name) -> Optional[int]:
 
 
 def _query_l2_size_bytes() -> Optional[int]:
-    """返回 L2 cache 字节数；查询失败返回 None（调用方据此关闭预取）。"""
+    """Return the L2 cache size in bytes; None on query failure (caller disables prefetch)."""
     home = os.environ.get("ASCEND_TOOLKIT_HOME") or os.environ.get("ASCEND_HOME_PATH")
     acl_paths = ["libascendcl.so", "libascendcl.so.1"]
     rt_paths = ["libruntime.so"]
@@ -99,7 +104,7 @@ def _query_l2_size_bytes() -> Optional[int]:
 
 
 def _is_capture_mode() -> bool:
-    """惰性 import，避免模块级依赖 model_executor 链路。"""
+    """Lazy import to avoid a module-level dependency on the model_executor chain."""
     from sglang.srt.model_executor.runner_utils.capture_mode import (
         get_is_capture_mode,
     )
@@ -108,7 +113,7 @@ def _is_capture_mode() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 管理器（进程级单例）
+# Manager (process-level singleton)
 # ---------------------------------------------------------------------------
 class _MoeWeightPrefetchManager:
     def __init__(self):
@@ -126,14 +131,14 @@ class _MoeWeightPrefetchManager:
         self._capacity_checked = False
         self._emitted_in_pass = False
 
-    # ---- 配置（首次注册时解析一次） ----
+    # ---- Configuration (parsed once at first registration) ----
     def configure(self):
         if self.configured:
             return
         self.configured = True
 
         if not envs.SGLANG_NPU_MOE_PREFETCH.get():
-            return  # enabled 保持 False，后续全部 no-op
+            return  # enabled stays False; everything below is a no-op
 
         ops_raw = str(envs.SGLANG_NPU_MOE_PREFETCH_OPS.get()).lower()
         ops = [t.strip() for t in ops_raw.split(",") if t.strip()]
@@ -152,16 +157,17 @@ class _MoeWeightPrefetchManager:
             )
             mode = "auto"
         if mode == "active":
-            # 图内 npu_prefetch 的 offset/max_size 是捕获期常量、节点无条件执行，
-            # 运行期激活索引喂不进烘死的 CMO 参数；active 需 copy-kernel +
-            # write-allocate 路线，本实现回退 full。
+            # In-graph npu_prefetch offset/max_size are capture-time constants and
+            # nodes execute unconditionally, so runtime active indices cannot be fed
+            # into the baked CMO params; 'active' would need a copy-kernel +
+            # write-allocate design. Fall back to 'full'.
             logger.warning(
                 "[MOE_PREFETCH] mode='active' is not supported "
                 "(in-graph CMO params are capture-time constants); "
                 "falling back to 'full'"
             )
             mode = "full"
-        self.mode = "full" if mode == "auto" else mode  # auto ≡ full
+        self.mode = "full" if mode == "auto" else mode  # auto == full
 
         chunk_mib = int(envs.SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB.get())
         if chunk_mib <= 0:
@@ -192,7 +198,7 @@ class _MoeWeightPrefetchManager:
             f"l2={self.l2_size >> 20}MiB budget={self.budget_bytes >> 20}MiB"
         )
 
-    # ---- 容量判据（首个 MoE 层注册时检查一次；各层同构） ----
+    # ---- Capacity check (checked once at first MoE layer registration; layers are homogeneous) ----
     def _check_capacity(self, w13_bytes: int, w2_bytes: int):
         if self._capacity_checked:
             return
@@ -207,8 +213,8 @@ class _MoeWeightPrefetchManager:
             )
             self.prefetch_gmm1 = False
         if self.prefetch_gmm2:
-            # 合并发射门控：w13（若 gmm1 开）+ w2 同驻一个跨层窗口，
-            # 合计 ≤ budget 才放行 gmm2。
+            # Merged-launch gate: w13 (if gmm1 is on) + w2 stay resident in the same
+            # cross-layer window; gmm2 is allowed only if the total fits the budget.
             resident = (w13_bytes if self.prefetch_gmm1 else 0) + w2_bytes
             if resident > self.budget_bytes:
                 logger.warning(
@@ -227,7 +233,7 @@ class _MoeWeightPrefetchManager:
                 f"(gmm2={self.prefetch_gmm2})"
             )
 
-    # ---- 模型注册（模型 init 期调用，capture 外） ----
+    # ---- Model registration (called during model init, outside capture) ----
     def register_model(self, model):
         self.configure()
         if not self.enabled:
@@ -236,7 +242,7 @@ class _MoeWeightPrefetchManager:
         if self.stream is None:
             import torch_npu  # noqa: F401
 
-            # 专用 CMO 流：capture 外创建（驱动调用），单例复用。
+            # Dedicated CMO stream: created outside capture (driver call), reused as a singleton.
             self.stream = torch.npu.Stream()
 
         block_types = None
@@ -258,14 +264,14 @@ class _MoeWeightPrefetchManager:
             w2 = getattr(experts, "w2_weight", None)
             layer_id = getattr(layer, "layer_id", None)
             if w13 is None or w2 is None or layer_id is None:
-                continue  # 稠密 MLP / PPMissingLayer / 非 MoE 层
+                continue  # dense MLP / PPMissingLayer / non-MoE layer
 
             self._check_capacity(
                 w13.numel() * w13.element_size(),
                 w2.numel() * w2.element_size(),
             )
-            # 目标层判定：仅当 j 为 GDN 层时以其为预取目标
-            # （FA 层 FIA KV 流自逐出 + 抢带宽）；w13 与 w2 共用目标层集合。
+            # Prefetch target: GDN layers only (an FA layer's FIA KV stream
+            # self-evicts and steals bandwidth); w13 and w2 share the target set.
             is_gdn = (
                 block_types is not None
                 and 0 <= layer_id < len(block_types)
@@ -276,8 +282,9 @@ class _MoeWeightPrefetchManager:
                 "w2": w2,
                 "prefetch_target": bool(is_gdn),
             }
-            # 发射门禁按层对象标记：未注册的层（如 MTP draft 模型的层，
-            # 其 layer_id 可能与注册表碰撞）一律不发射。
+            # The launch gate is marked per layer object: unregistered layers (e.g.
+            # MTP draft model layers, whose layer_id may collide with the registry)
+            # never launch.
             layer._moe_prefetch_emit = True
             n_reg += 1
 
@@ -288,12 +295,12 @@ class _MoeWeightPrefetchManager:
                 f"{n_target} GDN prefetch targets"
             )
 
-    # ---- 发射（仅 capture 期；best-effort，不 wait） ----
+    # ---- Launch (capture only; best-effort, no wait) ----
     def _emit_chunked(self, weights, anchor: torch.Tensor):
         import torch_npu
 
         cur = torch.npu.current_stream()
-        self.stream.wait_stream(cur)  # fork 边：罚金由预取流支付
+        self.stream.wait_stream(cur)  # fork edge: the penalty is paid by the prefetch stream
         with torch.npu.stream(self.stream):
             for weight in weights:
                 nbytes = weight.numel() * weight.element_size()
@@ -305,18 +312,19 @@ class _MoeWeightPrefetchManager:
         self._emitted_in_pass = True
 
     def emit(self, layer, anchor: torch.Tensor):
-        """本层 attention 开始前（层间通信全部完成后）发射本层 w13(+w2) 预取。
+        """Launch this layer's w13(+w2) prefetch before its attention starts (after all inter-layer communication).
 
-        发射点 = decoder layer forward 的 prepare_attn 之后。
-        EP 的层间通信（reduceScatter + allGather）在下一层 prepare_attn 内完成、
-        TP 的层尾 AR 在上一层 postprocess_layer 内完成，该点在两条线下都位于
-        全部层间通信之后。块序：w13 在前（消费截止 GMM1），w2 在后
-        （截止 GMM2，多一个 GMM1+SwiGLU 余量）。
+        Launch point = after prepare_attn in decoder layer forward. EP inter-layer
+        communication (reduceScatter + allGather) completes inside the next layer's
+        prepare_attn and TP's layer-end AR inside the previous layer's
+        postprocess_layer, so this point is after all inter-layer communication on
+        both paths. Chunk order: w13 first (consumed by GMM1), w2 after (consumed by
+        GMM2, with one extra GMM1+SwiGLU of slack).
         """
         if not self.enabled or not _is_capture_mode():
             return
         if not getattr(layer, "_moe_prefetch_emit", False):
-            return  # 未注册的层（MTP draft 等）不发射
+            return  # unregistered layers (MTP draft etc.) never launch
         target = self.layers.get(layer.layer_id)
         if target is None or not target["prefetch_target"]:
             return
@@ -329,7 +337,7 @@ class _MoeWeightPrefetchManager:
             return
         self._emit_chunked(weights, anchor)
 
-    # ---- step 末 drain（模型 forward 的 layer 循环后调用） ----
+    # ---- Step-end drain (called after the model forward layer loop) ----
     def drain(self):
         if not self.enabled or not self._emitted_in_pass or not _is_capture_mode():
             return
@@ -341,7 +349,7 @@ _MANAGER = _MoeWeightPrefetchManager()
 
 
 # ---------------------------------------------------------------------------
-# 对外接口（供 qwen3_5.py 调用）
+# Public interface (called by qwen3_5.py)
 # ---------------------------------------------------------------------------
 def moe_prefetch_register_model(model):
     _MANAGER.register_model(model)

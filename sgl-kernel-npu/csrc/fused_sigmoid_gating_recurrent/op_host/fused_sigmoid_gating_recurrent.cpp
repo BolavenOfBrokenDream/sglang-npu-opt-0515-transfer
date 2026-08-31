@@ -1,4 +1,4 @@
-// fused_sigmoid_gating_recurrent（GDN decode recurrent 的 AscendC 版）host 实现
+// fused_sigmoid_gating_recurrent (AscendC version of GDN decode recurrent) host implementation
 /**
  * This program is free software, you can redistribute it and/or modify it.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
@@ -14,16 +14,18 @@
  * \file fused_sigmoid_gating_recurrent.cpp
  * \brief fused_sigmoid_gating_recurrent host-side implementation
  *
- * 语义 = 生产 Triton kernel（sgl_kernel_npu fla fused_sigmoid_gating_recurrent
- * strided 形态）的 drop-in 替代：sigmoid gating + recurrent
- * delta rule update，仅 decode（每序列 1 token，T==N，varlen 必给 cu_seqlens）。
- * 无 tiling/workspace——按 recurrent_gated_delta_rule host 同款简式（EXEC_KERNEL_CMD
- * 直发，kernel 参数全按值/指针烘焙；graph capture 期 at::empty 输出进图私有池，
- * replay 复用——与生产 Triton wrapper 的 q.new_empty 同模式）。
+ * Semantics: drop-in replacement for the production Triton kernel (sgl_kernel_npu
+ * fla fused_sigmoid_gating_recurrent, strided form): sigmoid gating + recurrent
+ * delta rule update, decode only (one token per sequence, T == N, varlen requires
+ * cu_seqlens). No tiling/workspace: EXEC_KERNEL_CMD direct launch with all kernel
+ * args baked by value/pointer; during graph capture the at::empty output lands in
+ * the graph-private pool and is reused on replay (same pattern as the Triton
+ * wrapper's q.new_empty).
  *
- * 特化锁死项（kernel 按 K=V=128 写死；越限在这里直接报错，wrapper 侧已先行回退
- * stock Triton——本 TORCH_CHECK 是双保险）：K==V==128、HV<=8、HV%H==0、N<=256、
- * q/k/v 仅 bf16、a/b 仅 bf16、A_log/dt_bias 仅 fp32、pool bf16 或 fp32。
+ * Hard specializations (the kernel is written for K == V == 128; out-of-range
+ * inputs fail here, the wrapper falls back to stock Triton first — this
+ * TORCH_CHECK is a second line of defense): K == V == 128, HV <= 8, HV % H == 0,
+ * N <= 256, q/k/v bf16, a/b bf16, A_log/dt_bias fp32, pool bf16 or fp32.
  */
 
 #include <algorithm>
@@ -44,9 +46,9 @@
 namespace sglang {
 namespace npu_kernel {
 
-constexpr int64_t FGR_HEAD_DIM = 128;  // kernel 特化的 K/V
-constexpr int64_t FGR_MAX_HV = 8;      // kernel gating [8] pad 上限
-constexpr int64_t FGR_MAX_N = 256;     // kernel cu/idx UB 驻留上限
+constexpr int64_t FGR_HEAD_DIM = 128;  // kernel-specialized K/V
+constexpr int64_t FGR_MAX_HV = 8;      // kernel gating [8] pad cap
+constexpr int64_t FGR_MAX_N = 256;     // kernel cu/idx UB residency cap
 
 HOST_API at::Tensor fused_sigmoid_gating_recurrent_impl(
     const at::Tensor &A_log, const at::Tensor &a, const at::Tensor &dt_bias, double softplus_beta,
@@ -89,7 +91,7 @@ HOST_API at::Tensor fused_sigmoid_gating_recurrent_impl(
     const at::ScalarType poolDtype = initial_state_source.scalar_type();
     TORCH_CHECK(poolDtype == at::kBFloat16 || poolDtype == at::kFloat, "ssm pool must be bf16 or fp32");
 
-    // q/k/v 允许 strided 视图，仅要求末维连续且头维按 K/V 紧凑
+    // q/k/v accept strided views; only the last dim must be contiguous and the head dim packed by K/V
     TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1, "q/k/v last dim must be contiguous");
     TORCH_CHECK(q.stride(2) == K && k.stride(2) == K, "q/k head dim must be packed (stride(2) == K)");
     TORCH_CHECK(v.stride(2) == V, "v head dim must be packed (stride(2) == V)");
@@ -105,11 +107,11 @@ HOST_API at::Tensor fused_sigmoid_gating_recurrent_impl(
     TORCH_CHECK(initial_state_source.dim() == 4 && initial_state_source.size(1) == HV &&
                     initial_state_source.size(2) == K && initial_state_source.size(3) == V &&
                     initial_state_source.is_contiguous(),
-                "ssm pool must be contiguous [slots, HV, K, V]（非连续 pool 若拷贝副本会静默丢更新，硬断言）");
+                "ssm pool must be contiguous [slots, HV, K, V] (copying a non-contiguous pool would silently drop updates; hard assert)");
     TORCH_CHECK(initial_state_indices.numel() >= N, "initial_state_indices must have at least N elements");
     TORCH_CHECK(cu_seqlens.numel() == N + 1, "cu_seqlens must have N+1 elements");
 
-    // int64 索引条件性转 int32（生产为 int32；不转则是静默拷贝风险点，宁可显式）
+    // conditionally convert int64 indices to int32 (production is int32; skipping the conversion risks a silent copy, keep it explicit)
     at::Tensor idxI32 = initial_state_indices.scalar_type() == at::kInt
                             ? initial_state_indices
                             : initial_state_indices.to(at::kInt);
@@ -119,8 +121,8 @@ HOST_API at::Tensor fused_sigmoid_gating_recurrent_impl(
     TORCH_CHECK(scale > 0, "scale must be positive");
     TORCH_CHECK(softplus_beta != 0, "softplus_beta must be non-zero");
 
-    // 输出与 Triton wrapper 同形同 dtype（o = q.new_empty(N,HV,V).view(v.shape)：
-    // 连续 [1, T, HV, V]，T==N 元素一一对应）
+    // output same shape/dtype as the Triton wrapper (o = q.new_empty(N,HV,V).view(v.shape):
+    // contiguous [1, T, HV, V], T==N one-to-one)
     at::Tensor o = at::empty(v.sizes(), q.options());
 
     auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
@@ -136,11 +138,11 @@ HOST_API at::Tensor fused_sigmoid_gating_recurrent_impl(
 
     const float scaleF = static_cast<float>(scale);
     const float spbF = static_cast<float>(softplus_beta);
-    const float invSpbF = 1.0f / spbF;  // 与 Triton kernel 内 1.0/softplus_beta 同为 fp32 除法
+    const float invSpbF = 1.0f / spbF;  // same fp32 division as the Triton kernel's 1.0/softplus_beta
     const float thrF = static_cast<float>(softplus_threshold);
     const uint32_t useL2 = use_qk_l2norm ? 1U : 0U;
-    // EXEC_KERNEL_CMD 的 ConvertTypes(Ts&...) 只收左值，标量全部先落具名局部变量
-    // （直接传 static_cast 右值会编译失败）
+    // EXEC_KERNEL_CMD's ConvertTypes(Ts&...) takes lvalues only; all scalars must land in named
+    // locals first (passing static_cast rvalues fails to compile)
     const uint32_t nU32 = static_cast<uint32_t>(N);
     const uint32_t hU32 = static_cast<uint32_t>(H);
     const uint32_t hvU32 = static_cast<uint32_t>(HV);

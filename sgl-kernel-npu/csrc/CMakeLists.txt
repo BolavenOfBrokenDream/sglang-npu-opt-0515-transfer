@@ -30,7 +30,6 @@ FILE(GLOB OP_SRCS
     ${PROJECT_OP_SRC_BASE}/causal_conv1d/op_host/causal_conv1d.cpp
     ${PROJECT_OP_SRC_BASE}/apply_token_bitmask/op_host/apply_token_bitmask.cpp
     # TP_FUSION: fused_qkvzba_conv1d + fused_sigmoid_gating_recurrent
-    # （GDN decode recurrent 的 AscendC 版，AIV_ONLY）
     ${PROJECT_OP_SRC_BASE}/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.cpp
     ${PROJECT_OP_SRC_BASE}/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.cpp
     )
@@ -118,15 +117,20 @@ ascendc_compile_definitions(workspace_kernel PRIVATE
        -DHAVE_TILING
 )
 
-# TP_FUSION 的两个 kernel 放在独立库，--cce-auto-sync 显式钉死以免全局默认漂移。
-# 两 kernel 均按完整手工同步纪律编写（PipeBarrier/SetFlag 全显式），on/off 下均正确。
+# The two TP_FUSION kernels live in dedicated libraries with --cce-auto-sync
+# pinned explicitly so the global default cannot drift. Both kernels use fully
+# manual synchronization (explicit PipeBarrier/SetFlag) and are correct either
+# way.
 #
-# ⚠️ 两 kernel 必须分库：HAVE_WORKSPACE/HAVE_TILING 下工具链 auto_gen launch wrapper 按
-# 「末两参 = workspace/tiling」约定展开签名——fused_qkvzba_conv1d 签名尾恰为
-# GM_ADDR workspace/tiling，符合；fused_sigmoid_gating_recurrent 无 workspace/tiling、
-# 尾部是 8 个标量按值参数，同库会被 auto_gen 把倒数第二参 float softplusThreshold 错当
-# workspace 指针。故 recurrent 单独进 tp_fusion_recurrent_kernel，不带
-# HAVE_WORKSPACE/HAVE_TILING。
+# The two kernels must be in separate libraries: under
+# HAVE_WORKSPACE/HAVE_TILING the toolchain auto_gen launch wrapper expands the
+# signature per the "last two params = workspace/tiling" convention.
+# fused_qkvzba_conv1d ends in GM_ADDR workspace/tiling and matches;
+# fused_sigmoid_gating_recurrent has no workspace/tiling and ends in 8
+# by-value scalar params, so in the same library auto_gen would mistake the
+# second-to-last float softplusThreshold for a workspace pointer. Hence
+# recurrent goes alone into tp_fusion_recurrent_kernel, without
+# HAVE_WORKSPACE/HAVE_TILING.
 ascendc_library(tp_fusion_kernel STATIC
     ${PROJECT_OP_SRC_BASE}/fused_qkvzba_conv1d/op_kernel/fused_qkvzba_conv1d_kernel.cpp
 )
@@ -143,18 +147,21 @@ ascendc_compile_options(tp_fusion_kernel PRIVATE
        --cce-auto-sync=on
 )
 
-# ⚠️ recurrent 的 bf16/fp32 两入口必须一 kernel 一文件：
-# KERNEL_TASK_TYPE_DEFAULT 与「单文件多 kernel」不共存——同文件仅首个 kernel 注册
-# 成功，其余 RegisterAscendBinary aiv ret 107000、launch 查不到 kernel 挂死。
-# 共享类集中在 op_kernel/fused_sigmoid_gating_recurrent_kernel_lib.h。
+# The bf16/fp32 recurrent entries must be one kernel per file:
+# KERNEL_TASK_TYPE_DEFAULT does not coexist with multiple kernels in one file
+# — only the first kernel registers; the rest fail with RegisterAscendBinary
+# aiv ret 107000 and launch hangs with the kernel not found.
+# Shared classes live in op_kernel/fused_sigmoid_gating_recurrent_kernel_lib.h.
 ascendc_library(tp_fusion_recurrent_kernel STATIC
     ${PROJECT_OP_SRC_BASE}/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_bf16_kernel.cpp
     ${PROJECT_OP_SRC_BASE}/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_fp32_kernel.cpp
 )
-# 钉 =off：本 kernel 是全手工事件纪律的双缓冲流水（AllocEventID 事件 + 收尾
-# DrainEvents 排空），不用 TQue 编程模型——auto-sync 只对规范编程模型
-# （EnQue/DeQue/AllocTensor/FreeTensor）生效，=on 对本 kernel 无收益，只会在
-# 标量 GetValue/SetValue 处额外插入编译器自配事件（与手工事件同硬件池）。
+# Pin =off: this kernel is a double-buffered pipeline with fully manual event
+# discipline (AllocEventID events + DrainEvents draining at the end) and does
+# not use the TQue programming model — auto-sync only applies to the canonical
+# model (EnQue/DeQue/AllocTensor/FreeTensor). =on gains nothing here and only
+# inserts extra compiler-owned events at scalar GetValue/SetValue (same
+# hardware pool as the manual events).
 ascendc_compile_options(tp_fusion_recurrent_kernel PRIVATE
        --cce-auto-sync=off
 )

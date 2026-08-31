@@ -70,7 +70,7 @@ struct CausalConv1dTilingKey {
     int64_t hasCacheIndices;
     int64_t hasInitialState;
     int64_t hasNumAccept;
-    int64_t xRowStride;  // x 物理行距入 hash；旧算子恒=dim
+    int64_t xRowStride;  // x physical row stride goes into the hash; always = dim for the standalone op
 };
 
 struct CausalConv1dTilingKeyHash {
@@ -178,7 +178,7 @@ void ComputeTilingData(int64_t dim, int64_t cuSeqlen, int64_t seqLen, int64_t ba
     std::memset(&td, 0, sizeof(td));
 
     td.dim = dim;
-    td.xRowStride = dim;  // 旧算子行距恒=dim（numVHeads 由 memset 置 0）
+    td.xRowStride = dim;  // the standalone op's row stride is always dim (numVHeads stays 0 via memset)
     td.cuSeqlen = cuSeqlen;
     td.seqLen = seqLen;
     td.inputMode = inputMode;

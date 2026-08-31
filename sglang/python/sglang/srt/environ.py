@@ -536,27 +536,28 @@ class Envs:
     SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB = EnvInt(16)
     # Per-tensor capacity cap in MiB; 0 = auto (0.8 * queried L2 size)
     SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB = EnvInt(0)
-    # full_attention decode 融合（A1b split+KV scatter / A2 sigmoid_mul /
-    # A3a add_gemma_rms_norm，hardware_backend/npu/attention/
-    # full_attention_fusion_npu.py）总开关，默认开；DEBUG=1 按层打印守卫未命中原因
+    # full_attention decode fusion master switch (A1b split+KV scatter /
+    # A2 sigmoid_mul / A3a add_gemma_rms_norm, hardware_backend/npu/attention/
+    # full_attention_fusion_npu.py); DEBUG=1 logs per-layer guard misses
     SGLANG_NPU_FULL_ATTN_FUSION = EnvBool(True)
     SGLANG_NPU_FULL_ATTN_FUSION_DEBUG = EnvBool(False)
-    # TP 线 AscendC 融合总开关（默认关，仅 op1 fused_qkvzba_conv1d 跟随）；
-    # QKVZBA 为 op1 分开关（未设置随总开关，显式 0 单关）；
-    # GDN_RECURRENT_ASCENDC 为 op2 recurrent 开关（默认关，import 期判定，
-    # 须在建图/服务启动前设置）；DEBUG=1 打印守卫未命中原因
+    # TP-line AscendC fusion master switch (only op1 fused_qkvzba_conv1d
+    # follows it); QKVZBA is op1's own switch (unset = follow master, explicit
+    # 0 disables op1 alone); GDN_RECURRENT_ASCENDC is op2 recurrent's switch
+    # (off by default, resolved at import time — set before graph capture /
+    # server start); DEBUG=1 logs guard misses
     SGLANG_NPU_TP_ASCENDC_FUSION = EnvBool(False)
     SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA = EnvBool(False)
     SGLANG_NPU_GDN_RECURRENT_ASCENDC = EnvBool(False)
     SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG = EnvBool(False)
-    # GDN decode recurrent PR#740 优化 Triton 版开关（默认关）
+    # GDN decode recurrent PR#740 Triton variant switch
     SGLANG_NPU_GDN_UPDATE_FUSED = EnvBool(False)
-    # GDN 输入投影 qkvz+ba 权重打包单 GEMM（默认开）；MAX_M 为小 M 门控，
-    # M 超过阈值回退两次 GEMM
+    # GDN input-projection qkvz+ba weight pack into a single GEMM; MAX_M gates
+    # small M — M above the threshold falls back to two GEMMs
     SGLANG_NPU_GDN_QKVZBA_PACK = EnvBool(True)
     SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M = EnvInt(256)
-    # post_sample：异步 exponential-race 采样（910C 限定，默认关）；
-    # EXP_RACE_TRITON 为其融合 Triton 消费 kernel 开关（默认开）
+    # post_sample: async exponential-race sampling (910C only);
+    # EXP_RACE_TRITON enables its fused Triton consumer kernel
     SGLANG_NPU_ASYNC_EXPONENTIAL = EnvBool(False)
     SGLANG_NPU_EXP_RACE_TRITON = EnvBool(True)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)

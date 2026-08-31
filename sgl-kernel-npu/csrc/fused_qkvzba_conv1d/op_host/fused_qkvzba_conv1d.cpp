@@ -1,4 +1,4 @@
-// fused_qkvzba_conv1d（GDN decode：split + causal_conv1d 融合）host 实现
+// fused_qkvzba_conv1d (GDN decode: fused split + causal_conv1d) host implementation
 /**
  * This program is free software, you can redistribute it and/or modify it.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
@@ -14,19 +14,20 @@
  * \file fused_qkvzba_conv1d.cpp
  * \brief fused_qkvzba_conv1d host-side implementation
  *
- * 融合语义（对齐 sgl_kernel_npu/fla/utils.py 的 fused_qkvzba_split_reshape_cat_contiguous + torch.ops.npu.causal_conv1d）：
- *   y[B, qkvWidth]      = causal_conv1d(qkvz[:, :qkvWidth], ...)   —— x 按跨行距（xRowStride=qkvz.stride(0)）读前缀
- *   z[B, nv, head_v]    = qkvz[:, qkvWidth : qkvWidth+nv*head_v]   —— 同 kernel 顺带拷贝
- *   b[B, nv]            = mixed_ba[:, :nv]                          —— b 前 a 后
- *   a[B, nv]            = mixed_ba[:, nv : 2nv]
- * conv 部分逐 bit 等价于 causal_conv1d run_mode=1(UPDATE)：同一 tiling 结构、同一 device 类，
- * 仅 dim=qkvWidth、xRowStride=qkvz 物理行距。decode 空调用约定：has_initial_state / num_accepted_tokens 均按空处理。
+ * Fused semantics (matching fla/utils.py fused_qkvzba_split_reshape_cat_contiguous + torch.ops.npu.causal_conv1d):
+ *   y[B, qkvWidth]   = causal_conv1d(qkvz[:, :qkvWidth], ...)   -- x rows are read with stride xRowStride = qkvz.stride(0)
+ *   z[B, nv, head_v] = qkvz[:, qkvWidth : qkvWidth+nv*head_v]   -- copied by the same kernel
+ *   b[B, nv]         = mixed_ba[:, :nv]
+ *   a[B, nv]         = mixed_ba[:, nv : 2nv]
+ * The conv part is bit-exact with causal_conv1d run_mode=1 (UPDATE): same tiling struct, same device class,
+ * only dim = qkvWidth and xRowStride = physical row stride of qkvz. Decode empty-call convention:
+ * has_initial_state / num_accepted_tokens are always treated as empty.
  *
- * qkvz / mixed_ba 放行「行距视图」（stride(1)==1、行距 ≥ 逻辑宽度），可直接消费
- * 打包 GEMM 的非连续输出切片：xRowStride 取 stride(0)（连续输入时 == size(1)）；
- * zWidth 由 tiling 显式携带（行距含打包 pad 时不能由 xRowStride-dim 反推）；ba 行距由
- * tiling baRowStride 携带。对齐契约：xRowStride 仍须 16 倍数（z 行起始 32B 对齐）；
- * ba 拷贝走 DataCopyPad，不要求对齐。
+ * qkvz / mixed_ba accept row-stride views (stride(1)==1, row stride >= logical width), e.g. non-contiguous
+ * slices of packed GEMM output: xRowStride = stride(0) (== size(1) when contiguous); zWidth is carried
+ * explicitly in tiling (it cannot be derived as xRowStride - dim when the row stride includes pack padding);
+ * the ba row stride is carried as baRowStride. Alignment contract: xRowStride must still be a multiple of 16
+ * (32B alignment of z row starts); the ba copy uses DataCopyPad and requires no alignment.
  */
 
 #include <cstring>
@@ -45,7 +46,7 @@
 #include "torch_helper.h"
 #include "common.h"
 #include "fused_qkvzba_conv1d.h"
-#include "../../causal_conv1d/op_kernel/causal_conv1d_tiling_data.h"  // 复用同一 tiling 结构（含 xRowStride/numVHeads）
+#include "../../causal_conv1d/op_kernel/causal_conv1d_tiling_data.h"  // shared tiling struct (with xRowStride/numVHeads)
 
 namespace sglang {
 namespace npu_kernel {
@@ -55,12 +56,12 @@ constexpr int64_t MAX_DIM_TILE = 4096;
 constexpr int32_t MAX_WIDTH = 4;
 constexpr int32_t MIN_WIDTH = 2;
 constexpr uint32_t MAX_CAPTURE_NUM = 1024;
-constexpr int64_t Z_COPY_MAX_BYTES = 65535;  // 单块 DataCopy blockLen 上限（字节），z 行拷贝不切块
+constexpr int64_t Z_COPY_MAX_BYTES = 65535;  // single-block DataCopy blockLen limit (bytes); z row copy is never split
 
 constexpr uint32_t CAUSAL_CONV1D_TPL_RUN_MODE_UPDATE = 1;
 
-// 本算子独立的 tiling 缓存（复刻 causal_conv1d host 的 15 字段 hash + 全局 device buffer 方案，
-// 追加 xRowStride / numVHeads 两个维度，避免与老算子或不同形状间串缓存）
+// Op-local tiling cache (same field-hash + global device buffer scheme as the causal_conv1d host,
+// with xRowStride / numVHeads added so entries never collide with the standalone op or other shapes)
 static uint32_t g_fusedQkvzbaConv1dCaptureNum = 0;
 static std::unordered_map<uint64_t, uint32_t> g_fusedQkvzbaConv1dCaptureMap;
 
@@ -82,8 +83,8 @@ struct FusedQkvzbaConv1dTilingKey {
     int64_t hasNumAccept;
     int64_t xRowStride;
     int64_t numVHeads;
-    int64_t zWidth;       // 独立入 key（不由 xRowStride-dim 反推）
-    int64_t baRowStride;  // ba 物理行距（连续时 = 2*numVHeads）
+    int64_t zWidth;       // hashed explicitly (not derived as xRowStride - dim)
+    int64_t baRowStride;  // ba physical row stride (== 2*numVHeads when contiguous)
 };
 
 struct FusedQkvzbaConv1dTilingKeyHash {
@@ -132,8 +133,8 @@ struct UpdateDimTileChoice {
     int64_t gridSize = 0;
 };
 
-// 复刻 causal_conv1d host 的 ChooseUpdateBaseDimChoice（镜像 GE update-mode tiling 策略），
-// 注意这里 dim=qkvWidth 参与选择，与老链路的 mixed_qkv 场景完全一致。
+// Mirrors the causal_conv1d host's ChooseUpdateBaseDimChoice (GE update-mode tiling policy);
+// here dim = qkvWidth participates in the choice, identical to the old mixed_qkv path.
 UpdateDimTileChoice ChooseUpdateBaseDimChoice(int64_t batch, int64_t dim, int32_t numCores)
 {
     const int64_t candidates[] = {4096, 2048, 1024, 512, 384, 192};
@@ -177,9 +178,9 @@ UpdateDimTileChoice ChooseUpdateBaseDimChoice(int64_t batch, int64_t dim, int32_
     return result;
 }
 
-// 复刻 causal_conv1d host 的 ComputeTilingData，仅保留 decode(run_mode=1 UPDATE) 所需路径，
-// 并按空调用约定固定 hasInitialState=false / hasNumAccept=false。
-// zWidth / baRowStride 显式入 tiling（行距视图输入下不能由 xRowStride 反推）。
+// Mirrors the causal_conv1d host's ComputeTilingData, keeping only the decode (run_mode=1 UPDATE) path,
+// with hasInitialState=false / hasNumAccept=false per the empty-call convention.
+// zWidth / baRowStride go into tiling explicitly (cannot be derived from xRowStride for row-stride views).
 void ComputeTilingData(int64_t dim, int64_t cuSeqlen, int64_t seqLen, int64_t batch, int64_t inputMode, int64_t width,
                        int64_t stateLen, int64_t numCacheLines, int64_t activationMode, int64_t padSlotId, bool hasBias,
                        bool hasCacheIndices, bool isBf16, int32_t numCores, int64_t xRowStride, int64_t numVHeads,
@@ -189,10 +190,10 @@ void ComputeTilingData(int64_t dim, int64_t cuSeqlen, int64_t seqLen, int64_t ba
     std::memset(&td, 0, sizeof(td));
 
     td.dim = dim;
-    td.xRowStride = xRowStride;  // x 跨行距读（= qkvz 物理行距 stride(0)）
-    td.numVHeads = numVHeads;    // b/a 拷贝的 head 数
-    td.zWidth = zWidth;          // z 列宽显式携带（= numVHeads * head_v_dim）
-    td.baRowStride = baRowStride;  // mixed_ba 物理行距（连续时 = 2*numVHeads）
+    td.xRowStride = xRowStride;  // x rows are read with this stride (= qkvz.stride(0))
+    td.numVHeads = numVHeads;    // head count for the b/a copy
+    td.zWidth = zWidth;          // z column width carried explicitly (= numVHeads * head_v_dim)
+    td.baRowStride = baRowStride;  // mixed_ba physical row stride (== 2*numVHeads when contiguous)
     td.cuSeqlen = cuSeqlen;
     td.seqLen = seqLen;
     td.inputMode = inputMode;
@@ -204,13 +205,13 @@ void ComputeTilingData(int64_t dim, int64_t cuSeqlen, int64_t seqLen, int64_t ba
     td.padSlotId = padSlotId;
     td.hasBias = hasBias ? 1 : 0;
     td.hasCacheIndices = hasCacheIndices ? 1 : 0;
-    td.hasInitialStateMode = 0;   // decode 空调用：无 has_initial_state
+    td.hasInitialStateMode = 0;   // decode empty call: no has_initial_state
     td.hasInitStateWorkspace = 0;
-    td.hasNumAcceptedTokens = 0;  // decode 空调用：无 num_accepted_tokens（非投机采样路径）
+    td.hasNumAcceptedTokens = 0;  // decode empty call: no num_accepted_tokens (non-speculative path)
 
     td.dtypeKey = isBf16 ? 0 : 1;
     td.runModeKey = CAUSAL_CONV1D_TPL_RUN_MODE_UPDATE;
-    td.widthKey = (width == 2) ? 1 : (width == 3) ? 2 : 3;  // 与老 host 的 WIDTH_2/3/4 编码一致
+    td.widthKey = (width == 2) ? 1 : (width == 3) ? 2 : 3;  // same WIDTH_2/3/4 encoding as the old host
 
     UpdateDimTileChoice choice = ChooseUpdateBaseDimChoice(batch, dim, numCores);
     if (choice.baseDim <= 0 || choice.baseDimCnt <= 0) {
@@ -253,8 +254,8 @@ HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba
     TORCH_CHECK(conv_states.scalar_type() == dtype, "conv_states dtype must match qkvz dtype");
     TORCH_CHECK(mixed_ba.scalar_type() == dtype, "mixed_ba dtype must match qkvz dtype");
 
-    // 放行行距视图（打包 GEMM 的非连续输出切片）——列内连续（stride(1)==1）、
-    // 行距 >= 逻辑宽度即可；连续张量天然满足（stride(0)==size(1)）。
+    // Row-stride views (non-contiguous slices of packed GEMM output) are accepted: contiguous within a row
+    // (stride(1)==1) and row stride >= logical width; contiguous tensors satisfy this trivially.
     TORCH_CHECK(qkvz.stride(1) == 1 && qkvz.stride(0) >= qkvz.size(1),
                 "qkvz must be row-contiguous (stride(1)==1 and stride(0)>=size(1)); contiguous or pack row-stride view");
     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
@@ -272,24 +273,24 @@ HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba
     TORCH_CHECK(mixed_ba.size(1) == 2 * num_v_heads, "mixed_ba.size(1) must equal 2 * num_v_heads");
     TORCH_CHECK(mixed_ba.size(0) == qkvz.size(0), "mixed_ba and qkvz must have the same row count");
 
-    const int64_t dim = qkvWidth;  // conv 只消费每行前 qkvWidth 列（= 老链路 split 出的 mixed_qkv）
-    const int64_t xRowStride = qkvz.stride(0);       // 物理行距（连续输入时 == size(1)）
-    const int64_t baRowStride = mixed_ba.stride(0);  // 物理行距（连续输入时 == 2*numVHeads）
+    const int64_t dim = qkvWidth;  // conv consumes only the first qkvWidth columns of each row (= the old path's split-out mixed_qkv)
+    const int64_t xRowStride = qkvz.stride(0);       // physical row stride (== size(1) when contiguous)
+    const int64_t baRowStride = mixed_ba.stride(0);  // physical row stride (== 2*numVHeads when contiguous)
 
     const int64_t width = weight.size(0);
     TORCH_CHECK(width >= MIN_WIDTH && width <= MAX_WIDTH, "Only support width in [2,4]");
     TORCH_CHECK(weight.size(1) == dim, "weight must be [width, qkvWidth]");
 
-    // z/b/a 拷贝的对齐前提：z 行起始字节偏移 = element_size * (t * xRowStride + qkvWidth)，
-    // z 行字节数 = element_size * zWidth，均须 32B 对齐（kernel 侧用普通 DataCopy）；
-    // bf16/fp16 下即 qkvWidth / xRowStride 须为 16 的倍数（打包侧把打包 N 补到 16 倍数来满足，
-    // 连续输入时 xRowStride == size(1) == qkvWidth+zWidth）。
+    // Alignment contract for the z/b/a copy: z row start byte offset = element_size * (t * xRowStride + qkvWidth)
+    // and z row bytes = element_size * zWidth must both be 32B aligned (the kernel uses plain DataCopy);
+    // for bf16/fp16 this means qkvWidth / xRowStride must be multiples of 16 (the pack side pads the packed N
+    // to a multiple of 16; when contiguous, xRowStride == size(1) == qkvWidth + zWidth).
     TORCH_CHECK(qkvWidth % 16 == 0 && xRowStride % 16 == 0,
                 "qkvWidth and qkvz.stride(0) must be multiples of 16 (32B alignment for z DataCopy)");
     TORCH_CHECK(zWidth * static_cast<int64_t>(qkvz.element_size()) <= Z_COPY_MAX_BYTES,
                 "z row bytes exceed single-block DataCopy limit");
 
-    // decode 固定为 2D varlen 语义（对齐老 host 的 inputMode=0 路径）：batch 由 query_start_loc 推出
+    // decode is fixed to 2D varlen semantics (the old host's inputMode=0 path): batch is derived from query_start_loc
     const int64_t inputMode = 0;
     const int64_t seqLen = 0;
     const int64_t cuSeqlen = qkvz.size(0);
@@ -311,13 +312,13 @@ HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba
     at::Tensor b = at::empty({batch, num_v_heads}, qkvz.options());
     at::Tensor a = at::empty({batch, num_v_heads}, qkvz.options());
 
-    // 可选参数的 None→empty 转换，对齐老 host（causal_conv1d.cpp）
+    // None -> empty conversion for optional args, matching the old host (causal_conv1d.cpp)
     at::Tensor bias_tensor = hasBias ? bias : at::empty({0}, qkvz.options());
     at::Tensor query_start_loc_tensor = query_start_loc.to(at::kLong);
     at::Tensor cache_indices_tensor =
         hasCacheIndices ? cache_indices.to(at::kLong) : at::empty({0}, qkvz.options().dtype(at::kLong));
-    at::Tensor has_initial_state_tensor = at::empty({0}, qkvz.options().dtype(at::kLong));  // decode 空调用
-    at::Tensor num_accepted_tokens_tensor = at::empty({0}, qkvz.options().dtype(at::kInt));  // decode 空调用
+    at::Tensor has_initial_state_tensor = at::empty({0}, qkvz.options().dtype(at::kLong));  // decode empty call
+    at::Tensor num_accepted_tokens_tensor = at::empty({0}, qkvz.options().dtype(at::kInt));  // decode empty call
 
     auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     int32_t maxAivCore = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
@@ -327,7 +328,7 @@ HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba
                       pad_slot_id, hasBias, hasCacheIndices, isBf16, maxAivCore, xRowStride, num_v_heads,
                       zWidth, baRowStride, tilingData);
 
-    // run_mode=1(UPDATE)：totalBlocks = batch * baseDimCnt（对齐老 host）
+    // run_mode=1 (UPDATE): totalBlocks = batch * baseDimCnt (matching the old host)
     int64_t totalBlocks = tilingData.batch * tilingData.baseDimCnt;
     int32_t blockDim = std::min(maxAivCore, static_cast<int32_t>(totalBlocks));
     if (blockDim <= 0) {
@@ -335,7 +336,7 @@ HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba
     }
 
     int32_t libApiWorkspaceSize = static_cast<int32_t>(ascendc_platform->GetLibApiWorkSpaceSize());
-    // decode 空调用无 hasInitialState：ws=0，totalWorkspace = libApiWorkspaceSize（对齐老 host）
+    // decode empty call has no hasInitialState workspace: totalWorkspace = libApiWorkspaceSize (matching the old host)
     int64_t totalWorkspace = std::max(static_cast<int64_t>(libApiWorkspaceSize), static_cast<int64_t>(0));
     if (totalWorkspace <= 0) {
         totalWorkspace = libApiWorkspaceSize;
@@ -357,8 +358,8 @@ HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba
                                    static_cast<int64_t>(CAUSAL_CONV1D_TPL_RUN_MODE_UPDATE),
                                    hasBias ? 1 : 0,
                                    hasCacheIndices ? 1 : 0,
-                                   0,  // hasInitialState：decode 空调用
-                                   0,  // hasNumAccept：decode 空调用
+                                   0,  // hasInitialState: decode empty call
+                                   0,  // hasNumAccept: decode empty call
                                    xRowStride,
                                    num_v_heads,
                                    zWidth,

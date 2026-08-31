@@ -27,9 +27,10 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.state_indices_list_gdn = []
-        # decode 的 int32 影子 buffer：AscendC recurrent host 按 int32_t* 读
-        # cache_indices/cu_seqlens，decode 图流程每 step 图外同步一次（图内零 cast）；
-        # eager/verify 路径恒 None。
+        # decode int32 shadow buffers: the AscendC recurrent host reads
+        # cache_indices/cu_seqlens as int32_t*; synced once per step outside
+        # the decode graph (zero cast inside the graph); always None on the
+        # eager/verify paths.
         self.decode_state_indices_i32_list = []
         self.decode_query_start_loc_i32_list = []
         self.cached_cuda_graph_decode_query_start_loc_i32 = None
@@ -40,10 +41,12 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             max_num_tokens % max_bs == 0
         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         draft_token_num = max_num_tokens // max_bs
-        # state_indices / query_start_loc 主 buffer 用 int64：conv 类 AscendC 算子
-        # （causal_conv1d / fused_qkvzba_conv1d）host 按 int64_t* 读，直喂可省图内 cast。
-        # 例外：state_indices_list_gdn 保持 int32（recurrent_gated_delta_rule 按
-        # int32_t* 读且无校验，改了会静默算错）。
+        # state_indices / query_start_loc primary buffers use int64: the conv
+        # AscendC ops (causal_conv1d / fused_qkvzba_conv1d) read them as
+        # int64_t* on host, so feeding directly avoids an in-graph cast.
+        # Exception: state_indices_list_gdn stays int32 (recurrent_gated_delta_rule
+        # reads it as int32_t* without validation — changing it silently
+        # corrupts results).
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
@@ -76,8 +79,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
-            # decode 影子 buffer（recurrent 侧），每 step 由
-            # _capture/_replay_metadata 图外同步；不在 verify 使用。
+            # decode shadow buffers (recurrent side), synced outside the graph
+            # by _capture/_replay_metadata each step; not used in verify.
             self.decode_state_indices_i32_list.append(
                 torch.full(
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
@@ -89,8 +92,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int64, device=self.device
         )
-        # decode query_start_loc 是静态 arange——int32 版 init 期预建，影子同步
-        # 只做同 dtype copy。
+        # decode query_start_loc is a static arange — the int32 copy is built
+        # once at init, so shadow sync is just a same-dtype copy.
         self.cached_cuda_graph_decode_query_start_loc_i32 = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
@@ -105,11 +108,12 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
     def _update_decode_recurrent_shadow_i32(
         self, bs: int, mamba_indices: torch.Tensor, num_padding: int = 0
     ):
-        """同步 decode 的 int32 影子 buffer（图外 eager，每 step 一次）。
+        """Sync the decode int32 shadow buffers (outside the graph, once per step).
 
-        内容与 int64 主 buffer 完全一致，供 AscendC recurrent（host 按 int32_t*
-        读 cache_indices/cu_seqlens）直读。仅 decode/idle 调用；verify/eager
-        路径由调用方把 _decode_recurrent_shadow_i32 置 None。
+        Content is identical to the int64 primary buffers, for direct reads by
+        the AscendC recurrent (host reads cache_indices/cu_seqlens as int32_t*).
+        Called only for decode/idle; on the verify/eager paths the caller sets
+        _decode_recurrent_shadow_i32 to None.
         """
         idx_i32 = self.decode_state_indices_i32_list[bs - 1]
         qsl_i32 = self.decode_query_start_loc_i32_list[bs - 1]

@@ -28,12 +28,14 @@ if is_npu():
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
 
-    # NPU decode 的 recurrent kernel 三选一（import 期判定，须在服务启动前设置
-    # env；capture 后改无效）：
-    #   SGLANG_NPU_GDN_RECURRENT_ASCENDC=1 → AscendC 版（守卫未命中时内部回退 stock）
-    #   SGLANG_NPU_GDN_UPDATE_FUSED=1      → decode 优化 Triton 版
-    #   均未设置                           → stock
-    # 两个 env 同开时 ASCENDC 优先。
+    # Three-way choice of the NPU decode recurrent kernel (resolved at import
+    # time — set the env before server start; changing it after capture has no
+    # effect):
+    #   SGLANG_NPU_GDN_RECURRENT_ASCENDC=1 → AscendC version (falls back to
+    #                                        stock internally on guard miss)
+    #   SGLANG_NPU_GDN_UPDATE_FUSED=1      → decode-optimized Triton version
+    #   neither set                        → stock
+    # If both envs are set, ASCENDC wins.
     if os.environ.get("SGLANG_NPU_GDN_RECURRENT_ASCENDC", "0") == "1":
         from sglang.srt.hardware_backend.npu.tp_ascendc_fusion_npu import (
             fused_sigmoid_gating_delta_rule_update_ascendc as _gdn_decode_update,
@@ -169,8 +171,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        # _gdn_decode_update 在 import 期按 env 绑定（三选一）；kwargs 签名三方
-        # 全对齐。target_verify 传扩展参数、不经过本方法，不受影响。
+        # _gdn_decode_update is bound by env at import time (three-way); the
+        # kwargs signatures are aligned across all three. target_verify passes
+        # extended args and bypasses this method, so it is unaffected.
         return _gdn_decode_update(
             A_log=A_log,
             dt_bias=dt_bias,

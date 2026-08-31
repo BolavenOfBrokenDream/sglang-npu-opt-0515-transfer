@@ -1,23 +1,23 @@
-# Qwen3.5 NPU decode TP 主流线 AscendC 融合的开关/守卫模块。
+# Switch/guard module for Qwen3.5 NPU decode TP-path AscendC fusion.
 #
-# 两个算子（sgl-kernel-npu 主 csrc 注册为 torch.ops.npu.*）：
-#   op1 fused_qkvzba_conv1d           GDN decode：qkvzba split + causal_conv1d(UPDATE)
-#                                     单 kernel，返回 (y, z, b, a)，conv_states 原地更新。
-#   op2 fused_sigmoid_gating_recurrent GDN decode：sigmoid gating + delta rule update
-#                                     单 kernel（AIV_ONLY），生产 Triton kernel 的
-#                                     drop-in 替代，ssm pool 原地更新。
+# Two ops (registered by sgl-kernel-npu csrc as torch.ops.npu.*):
+#   op1 fused_qkvzba_conv1d            GDN decode: qkvzba split + causal_conv1d(UPDATE),
+#                                      single kernel, returns (y, z, b, a); conv_states updated in place.
+#   op2 fused_sigmoid_gating_recurrent GDN decode: sigmoid gating + delta rule update,
+#                                      single AIV_ONLY kernel; drop-in replacement for the
+#                                      production Triton kernel; ssm pool updated in place.
 #
-# fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm 不随本版构建（已止损下线），
-# 为兼容可能存在的旧版 qwen3_5.py（其 import 本模块的 5 个守卫函数），这两个算子
-# 的守卫函数以「恒停用」桩形式保留（返回 False/None，永不激活）。
+# fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm are not built in this version
+# (dropped); their guard functions are kept as always-disabled stubs so that an old
+# qwen3_5.py importing them still works.
 #
-# 开关：
-#   SGLANG_NPU_TP_ASCENDC_FUSION          总开关（默认 "0"），仅 op1 跟随
-#   SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA   op1 分开关：未设置随总开关，显式 "0" 单关
-#   SGLANG_NPU_GDN_RECURRENT_ASCENDC      op2 开关（默认 "0"）；在 gdn_triton.py import
-#                                         期判定，须在建图/服务启动前设置
-#   SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1  守卫未命中按 key 一次性打印
-# 图 capture 时守卫判定随 Python 分支烘进图，capture 后改 env 无效。
+# Switches:
+#   SGLANG_NPU_TP_ASCENDC_FUSION          master switch (default "0"), op1 only
+#   SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA   op1 switch: follows master when unset, explicit "0" disables op1 alone
+#   SGLANG_NPU_GDN_RECURRENT_ASCENDC      op2 switch (default "0"); evaluated at gdn_triton.py
+#                                         import time, must be set before graph capture / server start
+#   SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1  log guard misses once per key
+# Guard decisions are baked into the graph at capture time; changing env afterwards has no effect.
 
 import logging
 import os
@@ -32,35 +32,34 @@ _GDN_RECURRENT_ASCENDC_ENV = "SGLANG_NPU_GDN_RECURRENT_ASCENDC"
 _TP_DEBUG_ENV = "SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG"
 _tp_debug_logged = set()
 
-# op host 侧硬约束（与 csrc host TORCH_CHECK 逐条对应，见各 REGISTRATION.md）：
-_TP_C0_ALIGN = 16  # bf16 C0 对齐（op1 行宽须 16 倍数）
-_RECURRENT_HEAD_DIM = 128  # fused_sigmoid_gating_recurrent kernel 特化 K/V
-_RECURRENT_MAX_HV = 8  # 同上 gating [8] pad 上限
-_RECURRENT_MAX_N = 256  # 同上 cu/idx UB 驻留上限
+# Host-side hard constraints of the ops (mirror the csrc host TORCH_CHECKs; see each REGISTRATION.md):
+_TP_C0_ALIGN = 16  # bf16 C0 alignment (op1 row width must be a multiple of 16)
+_RECURRENT_HEAD_DIM = 128  # fused_sigmoid_gating_recurrent kernel specializes K/V to 128
+_RECURRENT_MAX_HV = 8  # gating [8] pad limit of the same kernel
+_RECURRENT_MAX_N = 256  # cu/idx UB residency limit of the same kernel
 
 _TP_OP_CACHE = {}
 
 
 def tp_fusion_enabled() -> bool:
-    """TP 线 AscendC 融合总开关（默认关；="1" 启用，仅 op1 跟随）。"""
+    """Master switch for TP-path AscendC fusion (default off; "1" enables, op1 only)."""
     return os.environ.get(_TP_FUSION_ENV, "0") == "1"
 
 
 def tp_fusion_qkvzba_enabled() -> bool:
-    """op1（fused_qkvzba_conv1d）开关：分开关未设置时随总开关，显式 "0" 单独关。"""
+    """op1 (fused_qkvzba_conv1d) switch: follows the master switch when unset; explicit "0" disables op1 alone."""
     return os.environ.get(
         _TP_FUSION_QKVZBA_ENV, os.environ.get(_TP_FUSION_ENV, "0")
     ) == "1"
 
 
 def gdn_recurrent_ascendc_enabled() -> bool:
-    """op2（fused_sigmoid_gating_recurrent，AscendC recurrent）开关：默认 "0"，
-    显式 "1" 才开。"""
+    """op2 (fused_sigmoid_gating_recurrent, AscendC recurrent) switch: default "0", enabled only by explicit "1"."""
     return os.environ.get(_GDN_RECURRENT_ASCENDC_ENV, "0") == "1"
 
 
 def tp_debug_log(key, msg):
-    """debug 开关打开时按 key 一次性打日志（定位守卫未命中环节用）。"""
+    """When the debug switch is on, log once per key (for locating guard misses)."""
     if os.environ.get(_TP_DEBUG_ENV, "0") != "1":
         return
     if key in _tp_debug_logged:
@@ -70,9 +69,10 @@ def tp_debug_log(key, msg):
 
 
 def tp_op_available(name: str) -> bool:
-    """torch.ops.npu 上算子是否已注册（即 sgl-kernel-npu 是否已带本包算子构建）。
+    """Whether the op is registered on torch.ops.npu (i.e. sgl-kernel-npu was built with these ops).
 
-    注册发生在 sgl_kernel_npu 扩展加载时（进程启动期），结果进程内静态，故缓存。
+    Registration happens when the sgl_kernel_npu extension loads (process start), so
+    the result is process-static and cached.
     """
     got = _TP_OP_CACHE.get(name)
     if got is None:
@@ -82,17 +82,18 @@ def tp_op_available(name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# op1（GDN decode）：fused_qkvzba_conv1d
+# op1 (GDN decode): fused_qkvzba_conv1d
 #   = fused_qkvzba_split_reshape_cat_contiguous + causal_conv1d(run_mode=1)
 # ---------------------------------------------------------------------------
 def tp_fused_qkvzba_conv1d_shape_supported(
     num_k_heads_tp, num_v_heads_tp, head_k_dim, head_v_dim, conv_kernel_size
 ) -> bool:
-    """init 期烘定的形状守卫（Qwen3_5GatedDeltaNet 级；头数为 TP 切分后 per-rank 值）。
+    """Shape guard baked at init (Qwen3_5GatedDeltaNet level; head counts are per-rank after TP split).
 
-    镜像算子 host TORCH_CHECK：num_v%num_k==0 且比值 ∈ {1,2,4}（与被替代的
-    qwen3_5.py split 分支条件一致）、conv width ∈ [2,4]、qkvWidth 与 qkvz 行宽
-    16 对齐（z 拷贝 32B DataCopy 对齐）、z 行字节 ≤ 65535（单块 DataCopy 上限）。
+    Mirrors the op host TORCH_CHECKs: num_v % num_k == 0 with ratio in {1,2,4} (same
+    as the replaced qwen3_5.py split-branch condition), conv width in [2,4], qkvWidth
+    and qkvz row width 16-aligned (32B DataCopy alignment of the z copy), z row
+    bytes <= 65535 (single-block DataCopy limit).
     """
     ok = (
         tp_fusion_qkvzba_enabled()
@@ -116,11 +117,11 @@ def tp_fused_qkvzba_conv1d_shape_supported(
     if not ok:
         tp_debug_log(
             ("qkvzba_shape",),
-            "fused_qkvzba_conv1d init 形状守卫未命中（回退 stock split+causal_conv1d）："
+            "fused_qkvzba_conv1d init shape guard missed (falling back to stock split+causal_conv1d): "
             f"nk_tp={num_k_heads_tp} nv_tp={num_v_heads_tp} dk={head_k_dim} "
             f"dv={head_v_dim} width={conv_kernel_size} "
             f"op_registered={tp_op_available('fused_qkvzba_conv1d')} "
-            f"{_TP_FUSION_QKVZBA_ENV}={os.environ.get(_TP_FUSION_QKVZBA_ENV, '<随总开关>')!r} "
+            f"{_TP_FUSION_QKVZBA_ENV}={os.environ.get(_TP_FUSION_QKVZBA_ENV, '<follows master>')!r} "
             f"{_TP_FUSION_ENV}={os.environ.get(_TP_FUSION_ENV, '0')!r}",
         )
     return ok
@@ -129,12 +130,14 @@ def tp_fused_qkvzba_conv1d_shape_supported(
 def tp_fused_qkvzba_conv1d_inputs_ok(
     qkvz, mixed_ba, num_k_heads_tp, num_v_heads_tp, head_k_dim, head_v_dim
 ) -> bool:
-    """backend 侧运行期轻量判定（tuple 输入的张量属性；形状主集合已在 init 烘定）。
+    """Lightweight runtime check on the backend side (tuple-input tensor attributes; the main shape set is baked at init).
 
-    连续性契约为「行距视图」：列内连续（stride(1)==1）、行距 >= 逻辑宽度且
-    qkvz 行距 16 倍数（镜像 host 对 z 拷贝 32B 对齐的 TORCH_CHECK）。连续输入
-    天然满足；行距视图（pack 打包 GEMM 输出切片）直读，免两次 .contiguous()。
-    注意：本判定须与 csrc host 同版本部署（旧 host 仍 TORCH_CHECK is_contiguous）。
+    Contiguity contract is a "row-stride view": column-contiguous (stride(1)==1), row
+    stride >= logical width, and qkvz row stride a multiple of 16 (mirrors the host
+    TORCH_CHECK for 32B alignment of the z copy). Contiguous inputs satisfy this
+    naturally; row-stride views (slices of the packed GEMM output) are read directly,
+    avoiding two .contiguous() calls. Must be deployed together with the matching
+    csrc host version (older hosts still TORCH_CHECK is_contiguous).
     """
     qkv_width = 2 * num_k_heads_tp * head_k_dim + num_v_heads_tp * head_v_dim
     return (
@@ -156,20 +159,22 @@ def tp_fused_qkvzba_conv1d_inputs_ok(
 
 
 # ---------------------------------------------------------------------------
-# op2（GDN decode）：fused_sigmoid_gating_recurrent（AscendC recurrent）
+# op2 (GDN decode): fused_sigmoid_gating_recurrent (AscendC recurrent)
 #
-# 与生产 Triton kernel 不承诺逐 bit 等价（K 维归约加法顺序 + Exp/Ln/Div 指令级
-# 差异），验收走有界误差 + 长程漂移 + e2e A/B 路径（见算子包 README「精度闸门」节）。
+# Not bit-exact with the production Triton kernel (K-dim reduction order +
+# instruction-level Exp/Ln/Div differences); acceptance follows bounded error +
+# long-run drift + e2e A/B (see the op package README "precision gate" section).
 # ---------------------------------------------------------------------------
 def _ascendc_recurrent_supported(
     q, k, v, a, b, initial_state_source, initial_state_indices, cu_seqlens,
     A_log, dt_bias,
 ) -> bool:
-    """运行期守卫（镜像 host TORCH_CHECK；未命中 → wrapper 回退 stock Triton）。
+    """Runtime guard (mirrors host TORCH_CHECKs; on miss the wrapper falls back to stock Triton).
 
-    只读张量属性（shape/stride/dtype/连续性），不读 device 数据，graph capture 安全。
-    A_log/dt_bias 的 fp32 dtype 不在此卡——wrapper 侧做无损加宽转换（见调用处），
-    此处只校验 numel 防 host TORCH_CHECK 崩出。
+    Reads tensor attributes only (shape/stride/dtype/contiguity), never device data,
+    so it is graph-capture safe. fp32 dtype of A_log/dt_bias is not enforced here —
+    the wrapper widens losslessly (see call site); only numel is checked to avoid a
+    host TORCH_CHECK failure.
     """
     ok = (
         tp_op_available("fused_sigmoid_gating_recurrent")
@@ -178,7 +183,7 @@ def _ascendc_recurrent_supported(
         and q.size(0) == 1
         and cu_seqlens is not None
         and torch.is_tensor(cu_seqlens)
-        and q.size(1) == cu_seqlens.numel() - 1  # T == N：每序列 1 token
+        and q.size(1) == cu_seqlens.numel() - 1  # T == N: 1 token per sequence
         and 1 <= q.size(1) <= _RECURRENT_MAX_N
         and q.size(3) == _RECURRENT_HEAD_DIM
         and v.size(3) == _RECURRENT_HEAD_DIM
@@ -213,7 +218,7 @@ def _ascendc_recurrent_supported(
     if not ok:
         tp_debug_log(
             ("recurrent_shape",),
-            "fused_sigmoid_gating_recurrent 运行期守卫未命中（回退 stock Triton）："
+            "fused_sigmoid_gating_recurrent runtime guard missed (falling back to stock Triton): "
             f"q={tuple(q.shape)}/{q.dtype} v={tuple(v.shape)}/{v.dtype} "
             f"pool={tuple(initial_state_source.shape)}/{initial_state_source.dtype} "
             f"T_vs_N={q.size(1)}/{cu_seqlens.numel() - 1 if torch.is_tensor(cu_seqlens) else None} "
@@ -238,11 +243,12 @@ def fused_sigmoid_gating_delta_rule_update_ascendc(
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
 ):
-    """生产 Triton wrapper（fused_sigmoid_gating_delta_rule_update_npu）
-    同签名同语义的 AscendC 版 drop-in，仅 decode（T==N）。
+    """AscendC drop-in replacement for the production Triton wrapper
+    (fused_sigmoid_gating_delta_rule_update_npu), same signature and semantics;
+    decode only (T==N).
 
-    守卫未命中 → 回退 stock Triton wrapper（静默回退；
-    SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1 时打一次原因）。
+    On guard miss, falls back to the stock Triton wrapper (silent; with
+    SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1 the reason is logged once).
     """
     if not _ascendc_recurrent_supported(
         q, k, v, a, b, initial_state_source, initial_state_indices, cu_seqlens,
@@ -268,14 +274,14 @@ def fused_sigmoid_gating_delta_rule_update_ascendc(
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
         )
-    # scale 默认值与 Triton wrapper 逐字一致（python 侧 K**-0.5，同 double→float 路径）
+    # scale default matches the Triton wrapper (python-side K**-0.5, same double->float path)
     if scale is None:
         scale = k.shape[-1] ** -0.5
     else:
         assert scale > 0, "scale must be positive"
-    # A_log/dt_bias：host 仅收 fp32，但 checkpoint 载入后可能为 bf16。
-    # wrapper 侧做无损加宽（与 Triton 核内 .to(tl.float32) 逐 bit 等价），并镜像
-    # Triton wrapper 的 .contiguous()。
+    # A_log/dt_bias: the host only accepts fp32, but they may be bf16 after checkpoint
+    # load. Widen losslessly here (bit-exact with the in-kernel .to(tl.float32) of the
+    # Triton kernel), mirroring the Triton wrapper's .contiguous().
     if A_log.dtype != torch.float32:
         A_log = A_log.float()
     if dt_bias.dtype != torch.float32:
@@ -304,37 +310,38 @@ def fused_sigmoid_gating_delta_rule_update_ascendc(
 
 
 # ---------------------------------------------------------------------------
-# 遗留桩（恒停用）：fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm
-# 这两个算子已止损下线、不随本版构建。旧版 qwen3_5.py 若 import 下列 5 个函数，
-# 桩保证其可正常运行且永不激活（调用方回退原链路）。
+# Legacy stubs (always disabled): fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm
+# These two ops were dropped and are not built in this version. If an old qwen3_5.py
+# imports the 5 functions below, the stubs keep it working and never activate
+# (callers fall back to the original path).
 # ---------------------------------------------------------------------------
 def tp_fusion_nqps_enabled() -> bool:
-    """fused_norm_qkv_proj_scatter 开关桩：恒 False（算子不构建，恒停用）。"""
+    """fused_norm_qkv_proj_scatter switch stub: always False (op not built)."""
     return False
 
 
 def tp_fusion_sigmm_enabled() -> bool:
-    """fused_sigmoid_mul_mm 开关桩：恒 False（算子不构建，恒停用）。"""
+    """fused_sigmoid_mul_mm switch stub: always False (op not built)."""
     return False
 
 
 def tp_norm_qkv_scatter_shape_supported(layer) -> bool:
-    """fused_norm_qkv_proj_scatter init 守卫桩：恒 False。"""
+    """fused_norm_qkv_proj_scatter init guard stub: always False."""
     return False
 
 
 def tp_norm_qkv_scatter_context(
     layer, hidden_states, residual, forward_batch, captured_last_layer_outputs
 ):
-    """fused_norm_qkv_proj_scatter 运行期守卫桩：恒 None（调用方回退原链路）。"""
+    """fused_norm_qkv_proj_scatter runtime guard stub: always None (caller falls back to the original path)."""
     return None
 
 
 def tp_sigmoid_mul_mm_shape_supported(o_proj) -> bool:
-    """fused_sigmoid_mul_mm init 守卫桩：恒 False。"""
+    """fused_sigmoid_mul_mm init guard stub: always False."""
     return False
 
 
 def tp_sigmoid_mul_mm_runtime_ok(attn_output, gate) -> bool:
-    """fused_sigmoid_mul_mm 运行期守卫桩：恒 False。"""
+    """fused_sigmoid_mul_mm runtime guard stub: always False."""
     return False

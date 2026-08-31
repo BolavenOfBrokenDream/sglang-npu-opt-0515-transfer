@@ -345,7 +345,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
     const int32_t stateLen = tilingData_->stateLen;
     const int32_t width = static_cast<int32_t>(tilingData_->width);
     const int32_t ringStart = MAX_WIDTH - width;
-    const int64_t xRowStride = tilingData_->xRowStride;  // x 物理行距（元素数），旧算子恒=dim
+    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
     LocalTensor<T> ring = inBuf.Get<T>();
 
     for (int32_t i = 0; i < ringStart; ++i) {
@@ -403,7 +403,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
     LocalTensor<T> outT = outBuf.Get<T>();
     const bool hasBias = HasBias();
     const bool hasActivation = HasActivation();
-    const int64_t xRowStride = tilingData_->xRowStride;  // x 物理行距（元素数），旧算子恒=dim
+    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
     for (int32_t t = 0; t < len; ++t) {
         const int32_t slotCurr = SlotCurr(t);
 
@@ -644,7 +644,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeqFnRolling(int32_t start, int32
     LocalTensor<T> ring = inBuf.Get<T>();
     LocalTensor<T> outT = outBuf.Get<T>();
     const bool hasActivation = HasActivation();
-    const int64_t xRowStride = tilingData_->xRowStride;  // x 物理行距（元素数），旧算子恒=dim
+    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
     RestoreFnLocalPartials(baseDim);
 
     for (int32_t t = 0; t < len; ++t) {
@@ -738,7 +738,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackStateSpec(int32_t cacheIdx,
 {
     const int32_t width = static_cast<int32_t>(tilingData_->width);
     const int32_t stateLen = tilingData_->stateLen;
-    const int64_t xRowStride = tilingData_->xRowStride;  // x 物理行距（元素数），旧算子恒=dim
+    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
     if (len <= 0) {
         return;
     }

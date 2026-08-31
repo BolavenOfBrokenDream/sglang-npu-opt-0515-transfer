@@ -108,7 +108,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRingSeqSplit(int32_t seq, int32_
     bool hasGmHistoryCopy = false;
     bool hasVectorInit = false;
     const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim + channelStart;
-    const int64_t xRowStride = tilingData_->xRowStride;  // x 物理行距（元素数），旧算子恒=dim
+    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
     int64_t xHistoryOffset = static_cast<int64_t>(historyStartTok) * xRowStride + channelStart;
 
     for (int32_t i = 0; i < ringStart; ++i) {

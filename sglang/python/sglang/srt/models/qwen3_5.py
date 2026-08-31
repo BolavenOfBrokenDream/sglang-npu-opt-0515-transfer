@@ -38,8 +38,8 @@ from sglang.srt.configs.qwen3_5 import (
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 
-# MoE 权重 L2 预取（SGLANG_NPU_MOE_PREFETCH）：注册、本层 prepare_attn 后发射、
-# step 末 drain；模块顶层不 import torch_npu，未启用时为 no-op。
+# MoE weight L2 prefetch (SGLANG_NPU_MOE_PREFETCH): launched after each layer's
+# prepare_attn, drained at step end; no torch_npu import at module top level, no-op when disabled.
 from sglang.srt.hardware_backend.npu.moe_weight_prefetch import (
     moe_prefetch_emit,
     moe_prefetch_register_model,
@@ -137,13 +137,14 @@ _qknorm_use_alt_stream = _is_cuda or (
 )
 _is_amx_available = cpu_has_amx_support()
 
-# GDN_QKVZBA_PACK：NPU 上把 GDN 层 in_proj_qkvz / in_proj_ba 的权重沿 N 拼成
-# 单块 [N_pack, K]（N_pack 补零行到 16 倍数，满足下游融合算子行距视图的对齐
-# 契约），一次 stock linear 取代两次 GEMM；数学逐列等价（pad 列输出无人消费）。
-# 默认开；=0 回退。仅 NPU + 非量化 bf16/fp16 生效，其余形态由运行期守卫回退。
+# GDN_QKVZBA_PACK: pack the in_proj_qkvz / in_proj_ba weights of GDN layers along N
+# into a single [N_pack, K] block (N_pack zero-padded up to a multiple of 16 for the
+# row-stride alignment contract of downstream fused ops), replacing two GEMMs with one
+# stock linear; column-wise equivalent (pad output columns are never consumed).
+# On by default; =0 reverts. NPU + unquantized bf16/fp16 only, guarded at runtime.
 _gdn_qkvzba_pack_env = get_bool_env_var("SGLANG_NPU_GDN_QKVZBA_PACK", "true")
-# 仅小 M 打包：大 M 下宽 N（非 256 tile 整数倍）的 ragged tiling 惩罚会超过
-# 省下的 ba GEMM。
+# Pack only for small M: at large M the ragged-tiling penalty of the wide N
+# (not a multiple of the 256 tile) outweighs the saved ba GEMM.
 _gdn_qkvzba_pack_max_m = int(os.getenv("SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M", "256"))
 
 cached_get_processor = lru_cache(get_processor)
@@ -189,8 +190,9 @@ if _is_npu:
         fa_v4_scatter_context,
     )
 
-    # TP 线 AscendC 融合算子接线（总开关 SGLANG_NPU_TP_ASCENDC_FUSION 默认关；
-    # 候选2/3 已下线，对应接口为恒停用桩，仅保 import 兼容）
+    # TP AscendC fusion wiring (master switch SGLANG_NPU_TP_ASCENDC_FUSION, default
+    # off; candidates 2/3 are retired, their interfaces are permanently disabled
+    # stubs kept only for import compatibility)
     from sglang.srt.hardware_backend.npu.tp_ascendc_fusion_npu import (
         tp_fused_qkvzba_conv1d_shape_supported,
         tp_norm_qkv_scatter_context,
@@ -201,10 +203,11 @@ if _is_npu:
 
 
 def _gdn_qkvzba_packable(proj_qkvz, proj_ba) -> bool:
-    """GDN_QKVZBA_PACK 运行期守卫（任一不满足 → 回退两次 GEMM 原链路）。
+    """Runtime guard for GDN_QKVZBA_PACK (any failure -> fall back to two GEMMs).
 
-    只允许最普通的非量化 2D 权重：FP8 等量化形态的 scale 布局与 packed GEMM
-    的加性不兼容，直接排除（量化形态由 quant_method 类名判定）。
+    Only plain unquantized 2D weights are allowed: quantized formats such as FP8
+    have scale layouts incompatible with the packed GEMM and are excluded
+    (detected via the quant_method class name).
     """
     wq = proj_qkvz.weight
     wb = proj_ba.weight
@@ -222,16 +225,18 @@ def _gdn_qkvzba_packable(proj_qkvz, proj_ba) -> bool:
 
 
 def _gdn_qkvzba_pack_materialize(proj_qkvz, proj_ba) -> torch.Tensor:
-    """物化 [N_pack, K] 打包权重，并把两模块 weight.data 重绑为其行切片。
+    """Materialize the packed [N_pack, K] weight and rebind both modules'
+    weight.data to row slices of it.
 
-    N_pack = (N_qkvz+N_ba) 向上补零行到 16 倍数：打包 GEMM 输出的物理行距
-    保持 16 倍数，满足下游融合算子行距视图输入的对齐契约；pad 行权重为零、
-    pad 列输出无任何消费者（ba 段切片不含 pad 尾行）。
+    N_pack = (N_qkvz+N_ba) rounded up to a multiple of 16, so the packed GEMM
+    output keeps a 16-aligned physical row stride as required by downstream fused
+    ops consuming row-stride views; pad rows are zero and pad output columns have
+    no consumer (the ba slice excludes the pad tail rows).
 
-    重绑后权重 loader / RL 权重同步的 in-place narrow+copy_ 写入直接落在打包
-    缓冲上、天然同步；若某路径整体替换 weight.data（指针漂移），调用方以
-    data_ptr 校验在下一次 forward 自动重新物化。
-    返回打包缓冲（调用方缓存，并以 weight.data_ptr() == packed.data_ptr() 校验）。
+    After rebinding, in-place narrow+copy_ writes from weight loaders / RL weight
+    sync land directly on the packed buffer; if some path replaces weight.data
+    wholesale (pointer drift), the caller's data_ptr check re-materializes on the
+    next forward.
     """
     wq = proj_qkvz.weight
     wb = proj_ba.weight
@@ -329,9 +334,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
         self._bind_packed_weight_loaders(self.in_proj_ba)
 
-        # GDN_QKVZBA_PACK：打包开关与惰性物化缓存。打包在权重就绪后的首次
-        # forward 物化，只改计算组织——两模块的参数、名称、loader、checkpoint
-        # 映射全部不变，9B dense 与 35B MoE 同享本开关。
+        # GDN_QKVZBA_PACK: enable flag and lazily materialized pack cache. Packing
+        # only reorganizes compute — parameters, names, loaders and checkpoint
+        # mappings of the two modules are unchanged.
         self._qkvzba_pack_enabled = _is_npu and _gdn_qkvzba_pack_env
         self._packed_qkvzba_weight: Optional[torch.Tensor] = None
 
@@ -353,9 +358,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         # State parameters
-        # dt_bias 与 A_log 一样按 fp32 物化：gating/recurrent 核内本就无损加宽到
-        # fp32，下游 AscendC recurrent host 硬要 fp32；源头 fp32 后 wrapper 的
-        # .float() 变 no-op。加载与 RL 权重同步均 copy_ 系（隐式转换），与 A_log 相同。
+        # dt_bias is materialized in fp32 like A_log: gating/recurrent kernels widen
+        # to fp32 losslessly anyway and the AscendC recurrent host requires fp32, so
+        # with fp32 at the source the wrapper's .float() becomes a no-op. Loading and
+        # RL weight sync are copy_-based (implicit cast), same as A_log.
         self.dt_bias = nn.Parameter(
             torch.ones(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
         )
@@ -410,9 +416,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        # TP_FUSION 候选1：fused_qkvzba_conv1d（split+causal_conv1d 单 kernel）的
-        # init 期形状守卫烘定（头数传 TP 切分后 per-rank 值）；未命中/总开关关闭
-        # 时 forward 走原 split+causal_conv1d 链路
+        # TP_FUSION candidate 1: bake the init-time shape guard for
+        # fused_qkvzba_conv1d (split+causal_conv1d in one kernel); head counts are
+        # per-rank (post-TP) values. On guard miss or master switch off, forward
+        # uses the original split+causal_conv1d path.
         self._tp_fused_qkvzba_ok = _is_npu and tp_fused_qkvzba_conv1d_shape_supported(
             triton.cdiv(self.num_k_heads, self.attn_tp_size),
             triton.cdiv(self.num_v_heads, self.attn_tp_size),
@@ -618,11 +625,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and seq_len <= _gdn_qkvzba_pack_max_m
                 and _gdn_qkvzba_packable(self.in_proj_qkvz, self.in_proj_ba)
             ):
-                # GDN_QKVZBA_PACK：单次打包 GEMM，输出 [M, N_pack] 按行切片成两段
-                # 行距视图（列内连续）；下游 split kernel 按 stride(0) 取行距、op1
-                # 融合算子原生收行距视图、fix_query_key_value_ordering 回退本就
-                # 拷贝，三条消费路径均零额外拷贝。ba 段切片须显式排除 pad 尾列
-                # （N_pack 可能 > N_qkvz+N_ba）。graph capture 按固定 bs 烘定本分支。
+                # GDN_QKVZBA_PACK: one packed GEMM whose [M, N_pack] output is
+                # sliced into two row-stride views (contiguous within each row);
+                # all consumers take them with zero extra copies — the split kernel
+                # reads the row stride via stride(0), the op1 fused op accepts
+                # row-stride views natively, and the fix_query_key_value_ordering
+                # fallback copies anyway. The ba slice must explicitly exclude the
+                # pad tail columns (N_pack may exceed N_qkvz+N_ba). Graph capture
+                # bakes this branch per fixed batch size.
                 projected_states_qkvzba = nn.functional.linear(
                     hidden_states, self._get_packed_qkvzba_weight()
                 )
@@ -636,11 +646,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return projected_states_qkvz, projected_states_ba
 
     def _get_packed_qkvzba_weight(self) -> torch.Tensor:
-        """GDN_QKVZBA_PACK：返回打包权重 [N_qkvz+N_ba, K]。
+        """GDN_QKVZBA_PACK: return the packed [N_qkvz+N_ba, K] weight.
 
-        惰性物化（权重加载完成后首次 forward 触发）；此后每次 forward 以
-        data_ptr 校验——in-place 写入（loader / RL 权重同步）下指针不变、
-        缓冲天然同步，整体替换 .data 时指针漂移、自动重新物化。
+        Materialized lazily on the first forward after weights are loaded; every
+        later forward revalidates via data_ptr — in-place writes (loader / RL weight
+        sync) keep the pointer so the buffer stays in sync, while wholesale .data
+        replacement moves the pointer and triggers re-materialization.
         """
         packed = self._packed_qkvzba_weight
         if (
@@ -667,11 +678,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        # TP_FUSION 候选1：decode 且 init 守卫命中时，qkvz/ba 投影以 tuple 直送
-        # GDN backend——split+causal_conv1d 在 torch.ops.npu.fused_qkvzba_conv1d
-        # 单 kernel 内完成，返回 (core_attn_out, z)；运行期守卫不通过时 backend
-        # 内部回退本地 split+stock conv，仍以 tuple 返回。打包路径的行距视图可
-        # 直送（host 契约：列内连续 + 行距 16 倍数，打包 N 已补齐）。
+        # TP_FUSION candidate 1: on decode with the init guard hit, pass the qkvz/ba
+        # projections to the GDN backend as a tuple — split+causal_conv1d run inside
+        # the single torch.ops.npu.fused_qkvzba_conv1d kernel, returning
+        # (core_attn_out, z); on runtime guard miss the backend falls back to local
+        # split+stock conv, still returning a tuple. Row-stride views from the
+        # packed path can be passed directly (host contract: contiguous within a row
+        # + 16-aligned row stride; the packed N is already padded).
         core_attn_out = None
         z = None
         if self._tp_fused_qkvzba_ok and forward_batch.forward_mode.is_decode():
@@ -683,7 +696,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
 
         if core_attn_out is None:
-            # NPU 也走融合 split kernel（上方 import 已按平台重绑定为 sgl_kernel_npu 版）
+            # NPU uses the fused split kernel too (the import above is rebound per
+            # platform to the sgl_kernel_npu version)
             if (
                 self.num_v_heads // self.num_k_heads in [1, 2, 4]
                 and not _is_cpu
@@ -846,9 +860,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        # MoE 权重 L2 预取：自目标发射——本层 prepare_attn 之后、attention 之前，
-        # 此点在 TP/EP 两线下都位于全部层间通信之后。仅 GDN 层；主流不 wait，
-        # step 末统一 drain。
+        # MoE weight L2 prefetch: launched from the target itself — after this
+        # layer's prepare_attn and before attention, a point after all inter-layer
+        # communication on both TP and EP paths. GDN layers only; the main stream
+        # does not wait, everything is drained at step end.
         moe_prefetch_emit(self, hidden_states)
 
         if not forward_batch.forward_mode.is_idle():
@@ -1048,7 +1063,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.alt_stream = alt_stream
 
         # full_attention A1b：TP 布局形状守卫在 init 时一次算定
-        # （q∈{1,2,4} 头 / kv=1 头 / head_dim=256 / rope=64 / 带 gate 才走自研融合 kernel）
+        # (per-rank q heads in {1,2,4} / 1 kv head / head_dim=256 / rope=64 / gated)
         self._fa_v4_shape_ok = _is_npu and fa_split_qkvgate_scatter_supported(
             self.num_heads,
             self.num_kv_heads,
@@ -1057,9 +1072,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.attn_output_gate,
         )
 
-        # TP_FUSION 候选2/候选3：norm+qkv_proj+KV scatter 三合一与
-        # sigmoid_mul+o_proj 融合的 init 期形状守卫烘定（未命中/总开关关闭 →
-        # 运行时走原链路）
+        # TP_FUSION candidates 2/3: bake init-time shape guards for the
+        # norm+qkv_proj+KV scatter triple fusion and the sigmoid_mul+o_proj fusion
+        # (guard miss or master switch off -> original path at runtime)
         self._tp_fa_norm_qkv_scatter_ok = _is_npu and tp_norm_qkv_scatter_shape_supported(
             self
         )
@@ -1264,9 +1279,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
-                # TP_FUSION 候选3：sigmoid_mul + o_proj GEMM 单 kernel（输出
-                # partial sum，无 bias 无 all-reduce，与 o_proj(reduce_results=False)
-                # 返回语义一致，直接作为本层输出返回）；守卫未命中回退 A2/stock 链
+                # TP_FUSION candidate 3: sigmoid_mul + o_proj GEMM in one kernel
+                # (outputs a partial sum, no bias no all-reduce, same return
+                # semantics as o_proj(reduce_results=False), so it is returned
+                # directly as this layer's output); guard miss falls back to the
+                # A2/stock path
                 if self._tp_sigmoid_mul_mm_ok and tp_sigmoid_mul_mm_runtime_ok(
                     attn_output, gate_val
                 ):
@@ -1291,19 +1308,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         tp_ctx,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """TP_FUSION 候选2 的 FA decode 主干（prepare 的 input_layernorm 并入 kernel）。
+        """FA decode body of TP_FUSION candidate 2 (prepare's input_layernorm is
+        folded into the kernel).
 
-        hidden_states/residual 为 prepare 前的原始张量（未做 add+norm）；返回
-        (o_proj partial 输出, kernel 产出的新 residual add_out)，供 forward 直接进
-        prepare_mlp。调用前须过 tp_norm_qkv_scatter_context（tp_ctx 非 None）。
+        hidden_states/residual are the raw pre-prepare tensors (no add+norm
+        applied); returns (o_proj partial output, add_out — the new residual
+        produced by the kernel) so forward can go straight to prepare_mlp. Caller
+        must have passed tp_norm_qkv_scatter_context (tp_ctx is not None).
         """
-        # 与 forward_prepare_npu 相同：首个全注意力层先刷新 sin/cos 缓存
+        # Same as forward_prepare_npu: the first full-attention layer refreshes the
+        # sin/cos cache first
         if self.attn.layer_id == (self.config.full_attention_interval - 1):
             self.rotary_emb.get_cos_sin_with_position(positions)
 
         rope_dim = int(self.head_dim * self.partial_rotary_factor)
-        # kernel 要求 [M,64] fp32 连续；NPU 默认 rope cache 为 bf16 → widening
-        # cast 到 fp32（bf16→fp32 精确）
+        # The kernel requires contiguous [M,64] fp32; the NPU rope cache defaults to
+        # bf16, so widen-cast to fp32 (bf16 -> fp32 is exact)
         sin = self.rotary_emb.position_sin.view(-1, rope_dim)
         cos = self.rotary_emb.position_cos.view(-1, rope_dim)
         if sin.dtype != torch.float32:
@@ -1330,11 +1350,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.input_layernorm.variance_epsilon,
             self.q_norm.variance_epsilon,
         )
-        # k/v 已由 kernel 按 out_cache_loc 直写 cache（同 A1b 约定：save_kv_cache=False）
+        # k/v were already written into the cache by the kernel at out_cache_loc
+        # (same contract as A1b: save_kv_cache=False)
         attn_output = self.attn(q, None, None, forward_batch, save_kv_cache=False)
 
-        # 候选3（与 self_attention 尾部同一套守卫）：命中则 A2+o_proj 一并融合；
-        # 未命中回退 A2/stock 尾部（gate 为 kernel 直出的 2D 连续张量）
+        # Candidate 3 (same guards as the self_attention tail): on hit, A2+o_proj
+        # are fused together; on miss, fall back to the A2/stock tail (gate is a
+        # contiguous 2D tensor straight from the kernel)
         if self._tp_sigmoid_mul_mm_ok and tp_sigmoid_mul_mm_runtime_ok(
             attn_output, gate
         ):
@@ -1358,12 +1380,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
-        # TP_FUSION 候选2：decode 且运行期守卫全命中时，跳过 prepare 内的
-        # input_layernorm——add+norm 已由 fused_norm_qkv_proj_scatter 并入 kernel，
-        # 原始 hidden_states/residual 直进 kernel，add_out 作为新 residual 进
-        # prepare_mlp。本配置（TP、无 dp-attention、非首层、无 AR fusion pending）
-        # 下 prepare_attn 除 norm 外恒为空操作，故跳过无遗漏；任一前提破坏 →
-        # tp_ctx=None，走下方原链路。
+        # TP_FUSION candidate 2: on decode with all runtime guards hit, skip the
+        # input_layernorm inside prepare — add+norm is folded into
+        # fused_norm_qkv_proj_scatter, the raw hidden_states/residual go straight
+        # into the kernel, and add_out becomes the new residual for prepare_mlp.
+        # In this configuration (TP, no dp-attention, not the first layer, no
+        # pending AR fusion) prepare_attn is a no-op apart from the norm, so
+        # skipping it loses nothing; if any premise breaks, tp_ctx is None and the
+        # original path below runs.
         tp_ctx = (
             tp_norm_qkv_scatter_context(
                 self,
@@ -1385,8 +1409,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 )
             )
 
-        # MoE 权重 L2 预取：保持在本层全部层间通信之后、attention 之前。
-        # TP 候选2命中时 prepare_attn 被同语义融合路径替代，层间 AR 已由上一层完成。
+        # MoE weight L2 prefetch: keep this after all inter-layer communication of
+        # the layer and before attention. When TP candidate 2 hits, prepare_attn is
+        # replaced by the equivalent fused path and the inter-layer AR was already
+        # done by the previous layer.
         moe_prefetch_emit(self, hidden_states)
 
         if tp_ctx is not None:
@@ -1595,9 +1621,10 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
-        # MoE 权重 L2 预取：注册本模型各层 MoE 权重（layer_id → w13/w2 及 GDN
-        # 目标层标记），并在 capture 外创建专用预取流；is_nextn 的 MTP draft
-        # 模型不注册（其层无发射标记，draft capture 内不会误发射）。
+        # MoE weight L2 prefetch: register each layer's MoE weights (layer_id ->
+        # w13/w2 plus the GDN target-layer flag) and create a dedicated prefetch
+        # stream outside capture; the is_nextn MTP draft model is not registered
+        # (its layers carry no launch flag, so draft capture never launches prefetch).
         if not is_nextn:
             moe_prefetch_register_model(self)
 
@@ -1669,8 +1696,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
 
-        # MoE 权重 L2 预取：step 末 drain——主流 join 预取流（capture 合法性 +
-        # 防跨 step 积压）；未启用/本 pass 未发射时为 no-op。
+        # MoE weight L2 prefetch: drain at step end — the main stream joins the
+        # prefetch stream (capture legality + no cross-step backlog); no-op when
+        # disabled or when this pass launched nothing.
         moe_prefetch_step_drain()
 
         # Return intermediate tensors for pipeline parallelism

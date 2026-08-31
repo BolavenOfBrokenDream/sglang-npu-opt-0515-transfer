@@ -1,4 +1,4 @@
-// fused_qkvzba_conv1d（GDN decode：split + causal_conv1d 融合）host 声明
+// fused_qkvzba_conv1d (GDN decode: fused split + causal_conv1d) host declaration
 /**
  * This program is free software, you can redistribute it and/or modify it.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
@@ -25,7 +25,7 @@
 namespace sglang {
 namespace npu_kernel {
 
-// 返回 (y, z, b, a)：y=[B, qkvWidth]（conv 输出）、z=[B, num_v_heads, head_v_dim]、b/a=[B, num_v_heads]
+// Returns (y, z, b, a): y=[B, qkvWidth] (conv output), z=[B, num_v_heads, head_v_dim], b/a=[B, num_v_heads]
 HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_conv1d_impl(
     const at::Tensor &qkvz, const at::Tensor &weight, const at::Tensor &conv_states, const at::Tensor &mixed_ba,
     int64_t num_k_heads, int64_t num_v_heads, int64_t head_k_dim, int64_t head_v_dim, const at::Tensor &bias,

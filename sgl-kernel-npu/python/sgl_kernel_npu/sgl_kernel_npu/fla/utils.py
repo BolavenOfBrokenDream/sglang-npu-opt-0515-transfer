@@ -603,9 +603,11 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     total_k = num_heads_qk * head_qk
     total_v = num_heads_v * head_v
 
-    # GDN_QKVZBA_PACK：行距按物理 stride(0) 取——打包 GEMM 输出的行切片视图
-    # 行距 = N_qkvz+N_ba（> 逻辑宽度）；连续输入时与原先按逻辑宽度计算的
-    # 值完全相等，行为不变。非行主序输入（stride(1) != 1）兜底物化连续副本。
+    # GDN_QKVZBA_PACK: take the row stride from the physical stride(0) — a row
+    # slice view of the packed GEMM output has row stride N_qkvz+N_ba (larger
+    # than the logical width); for contiguous inputs it equals the logical
+    # width, so behavior is unchanged. Non row-major inputs (stride(1) != 1)
+    # fall back to a materialized contiguous copy.
     if mixed_qkvz.stride(1) != 1:
         mixed_qkvz = mixed_qkvz.contiguous()
     if mixed_ba.stride(1) != 1:

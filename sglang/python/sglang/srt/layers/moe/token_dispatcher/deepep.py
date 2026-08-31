@@ -487,8 +487,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_output: TopKOutput,
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        # front_fusion bf16 直出时恢复 deepep 线 topk_weights 的 fp32 契约
-        # （fp32 出口下此行为 no-op）。
+        # Restore the deepep path's fp32 contract for topk_weights when
+        # front_fusion emits bf16 directly (no-op when the output is fp32).
         topk_weights = topk_weights.to(torch.float32)
         topk_ids = topk_ids.to(torch.int64)
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
@@ -655,8 +655,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        # front_fusion bf16 直出时恢复 deepep 线 topk_weights 的 fp32 契约
-        # （fp32 出口下此行为 no-op）。
+        # Restore the deepep path's fp32 contract for topk_weights when
+        # front_fusion emits bf16 directly (no-op when the output is fp32).
         topk_weights = topk_weights.to(torch.float32)
         topk_ids = topk_ids.to(torch.int64)
         expected_m = (

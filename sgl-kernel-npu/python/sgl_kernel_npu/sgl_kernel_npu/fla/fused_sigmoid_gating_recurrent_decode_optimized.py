@@ -1,17 +1,20 @@
 # Decode-optimized GDN recurrent state update for Ascend NPU.
 #
-# 来源：sgl-kernel-npu PR #740 的
-# ``fla/fused_sigmoid_gating_recurrent_decode_optimized.py``，叠加 strided q/k/v
-# 支持（``q/k/v_row_stride`` 寻址 + wrapper 免 contiguous）。PR 原版按 packed
-# 布局寻址 ``(bos*H+i_h)*K`` 且 wrapper 对非连续输入直接 ``.contiguous()``
-# 拷贝——在 fused split 产出 strided 视图的部署形态下会引入每层 3 份额外拷贝。
+# Based on sgl-kernel-npu PR #740's
+# ``fla/fused_sigmoid_gating_recurrent_decode_optimized.py``, with strided
+# q/k/v support added (``q/k/v_row_stride`` addressing + contiguous-free
+# wrapper). The PR original addresses the packed layout ``(bos*H+i_h)*K`` and
+# its wrapper calls ``.contiguous()`` on non-contiguous inputs — with fused
+# split producing strided views, that costs 3 extra copies per layer.
 #
-# 优化点（承自 PR #740）：1-D grid 封顶 AIV 向量核数、program 内按
-# (sequence, value-head) tile 循环、V 维 BV=64 分块且 gating 每 (seq,v-head)
-# 只算一次、num_warps=4、轻量 contiguous 检查替代通用 input_guard。
+# Optimizations (from PR #740): 1-D grid capped at the AIV vector core count,
+# per-program loop over (sequence, value-head) tiles, BV=64 blocking over V
+# with gating computed once per (seq, v-head), num_warps=4, and a lightweight
+# contiguity check instead of the generic input_guard.
 #
-# 限制：仅 decode（每序列 T=1；wrapper 断言 total_tokens == N）。NK>1 不支持。
-# target_verify 的扩展参数（disable_state_update 等）不支持，不要用于 verify。
+# Limitations: decode only (T=1 per sequence; the wrapper asserts
+# total_tokens == N). NK>1 is unsupported. The target_verify extras
+# (disable_state_update etc.) are unsupported; do not use for verify.
 
 from typing import Optional
 
@@ -76,8 +79,8 @@ def _fused_sigmoid_gating_delta_rule_update_decode_kernel(
     stride num_programs, processing the value dimension in BV=64 blocks and
     reusing the gating computation across those blocks.
 
-    q/k/v 按 token 行 stride 寻址：连续输入时
-    q_row_stride == H*K / v_row_stride == HV*V，与 PR 原版寻址恒等。
+    q/k/v are addressed by token row stride: for contiguous inputs
+    q_row_stride == H*K / v_row_stride == HV*V, identical to the PR original.
     """
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
@@ -123,7 +126,6 @@ def _fused_sigmoid_gating_delta_rule_update_decode_kernel(
             b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
             # q/k are shared across the value dimension; set pointers once.
-            # token 行寻址由 (bos*H+i_h)*K 改为 bos*q_row_stride + i_h*K。
             p_q = q + bos * q_row_stride + i_h * K + o_k
             p_k = k + bos * k_row_stride + i_h * K + o_k
 
@@ -132,8 +134,8 @@ def _fused_sigmoid_gating_delta_rule_update_decode_kernel(
                 mask_v = o_v < V
                 mask_h = mask_k[:, None] & mask_v[None, :]
 
-                # v 同样按 v_row_stride 寻址；o 为本 wrapper 自建的
-                # 连续 buffer，保持 PR 原版寻址。
+                # v uses v_row_stride likewise; o is a contiguous buffer
+                # owned by this wrapper and keeps the PR-original addressing.
                 p_v = v + bos * v_row_stride + i_hv * V + o_v
                 p_o = o + (bos * HV + i_hv) * V + o_v
 
@@ -210,18 +212,22 @@ def fused_sigmoid_gating_delta_rule_update_decode_npu(
     the same algorithm. It launches with num_warps=4 for better small-batch
     throughput on the AIV vector cores.
 
-    q/k/v 允许非连续视图（仅要求末维 stride==1），
-    kernel 按传入的 token 行 stride 寻址，消去 decode 路径每层 3 份 q/k/v
-    拷贝；连续输入时寻址与 PR 原版完全一致。
+    q/k/v may be non-contiguous views (only last-dim stride==1 is required);
+    the kernel addresses them by the passed token row strides, eliminating 3
+    per-layer q/k/v copies on the decode path. Contiguous inputs address
+    identically to the PR original.
 
     Args / Returns: same as ``fused_sigmoid_gating_delta_rule_update_npu``
-    （返回形状与 v 相同；PR 原版返回 (N, HV, V)，本版 ``view`` 回 v 的形状，
-    decode 下 token 数 == N，两者元素一一对应）。
+    (return shape matches v; the PR original returns (N, HV, V) and this
+    version ``view``s back to v's shape — under decode the token count == N,
+    so the elements correspond one-to-one).
     """
-    # q/k/v 不 contiguous，仅断言末维 stride==1；行 stride 传入 kernel。
+    # q/k/v stay as views; only last-dim stride==1 is asserted, row strides go
+    # to the kernel.
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
-    # pool 必须连续：若对非连续 pool 做 _maybe_contiguous 拷贝，状态写回会落在
-    # 副本上（静默丢更新），故硬断言。
+    # The pool must be contiguous: copying a non-contiguous pool via
+    # _maybe_contiguous would write state updates back into the copy
+    # (silently losing them), hence the hard assert.
     assert initial_state_source.is_contiguous()
     A_log = _maybe_contiguous(A_log)
     a = _maybe_contiguous(a)
@@ -238,10 +244,10 @@ def fused_sigmoid_gating_delta_rule_update_decode_npu(
     V = v.shape[-1]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
-    # decode-only 守卫：o 按 token 下标 (bos) 寻址但只有 N 行，仅每序列恰好
-    # 1 token 时寻址合法——varlen 要求 total_tokens == N（生产 decode 的
-    # query_start_loc 步长恒 1），非 varlen 要求 T == 1。
-    # verify/prefill 不得走本 kernel。
+    # Decode-only guard: o is addressed by token index (bos) but has only N
+    # rows, valid only with exactly 1 token per sequence — varlen requires
+    # total_tokens == N (production decode has query_start_loc step 1),
+    # non-varlen requires T == 1. verify/prefill must not use this kernel.
     if cu_seqlens is not None:
         assert T == N, (
             f"decode-optimized kernel requires one token per sequence, "
@@ -317,6 +323,6 @@ def fused_sigmoid_gating_delta_rule_update_decode_npu(
         num_stages=num_stages,
         multibuffer=False,
     )
-    # 与 generic wrapper 的返回形状对齐（generic 返回 *v.shape）；decode 下
-    # token 数 == N，元素一一对应。
+    # Match the generic wrapper's return shape (*v.shape); under decode the
+    # token count == N, so the elements correspond one-to-one.
     return o.view(v.shape)
