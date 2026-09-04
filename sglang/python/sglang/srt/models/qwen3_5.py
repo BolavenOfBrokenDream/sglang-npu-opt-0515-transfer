@@ -74,7 +74,10 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.layers.radix_linear_attention import (
+    RadixLinearAttention,
+    wrap_conv1d_weight_loader,
+)
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -340,23 +343,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._qkvzba_pack_enabled = _is_npu and _gdn_qkvzba_pack_env
         self._packed_qkvzba_weight: Optional[torch.Tensor] = None
 
-        # Conv1d weight loader setup
-        query_key_settings = (self.key_dim, 0, False)
-        value_settings = (self.value_dim, 0, False)
-
-        self._override_weight_loader(
-            self.conv1d.weight,
-            mamba_v2_sharded_weight_loader(
-                [
-                    query_key_settings,
-                    query_key_settings,
-                    value_settings,
-                ],
-                self.attn_tp_size,
-                self.attn_tp_rank,
-            ),
-        )
-
         # State parameters
         # dt_bias is materialized in fp32 like A_log: gating/recurrent kernels widen
         # to fp32 losslessly anyway and the AscendC recurrent host requires fp32, so
@@ -388,6 +374,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             activation=self.activation,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
+        )
+
+        # Conv1d weight loader setup. The wrapper refreshes the transposed
+        # copy cached on self.attn by the attention backend after every
+        # (re)load, so it must be bound after self.attn exists.
+        query_key_settings = (self.key_dim, 0, False)
+        value_settings = (self.value_dim, 0, False)
+
+        self._override_weight_loader(
+            self.conv1d.weight,
+            wrap_conv1d_weight_loader(
+                self.attn,
+                mamba_v2_sharded_weight_loader(
+                    [
+                        query_key_settings,
+                        query_key_settings,
+                        value_settings,
+                    ],
+                    self.attn_tp_size,
+                    self.attn_tp_rank,
+                ),
+            ),
         )
 
         self.norm = RMSNormGated(

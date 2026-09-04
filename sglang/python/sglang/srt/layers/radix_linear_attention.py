@@ -35,6 +35,27 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def wrap_conv1d_weight_loader(attn: RadixLinearAttention, base_loader):
+    """Wrap conv1d.weight's loader so every (re)load also refreshes the
+    transposed copy cached on the RadixLinearAttention wrapper.
+
+    mamba_v2_sharded_weight_loader writes through ``param.data[...] = ...``;
+    ``Tensor.data`` carries a version counter independent of the Parameter's,
+    so ``_version``-based invalidation cannot observe online weight updates
+    (e.g. RL Actor->SGLang sync via ``update_weights_from_tensor``). The
+    refresh is explicit and in place so captured graphs keep referencing the
+    same storage.
+    """
+
+    def loader(param, loaded_weight):
+        base_loader(param, loaded_weight)
+        cached = getattr(attn, "_conv_weights_t", None)
+        if cached is not None:
+            cached.copy_(attn.conv_weights.transpose(0, 1))
+
+    return loader
+
+
 class RadixLinearAttention(nn.Module):
     """
     The Linear Attention Layer Implementation.
