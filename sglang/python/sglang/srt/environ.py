@@ -536,6 +536,15 @@ class Envs:
     SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB = EnvInt(16)
     # Per-tensor capacity cap in MiB; 0 = auto (0.8 * queried L2 size)
     SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB = EnvInt(0)
+    # MoE layer-tail fin+add+AR+norm fusion (master switch; takes effect only
+    # when SGLANG_NPU_USE_MULTI_STREAM=1 — the fused add is dual-stream-only;
+    # see hardware_backend/npu/tp_fused_tail_npu.py)
+    SGLANG_NPU_MOE_TAIL_FUSION = EnvBool(False)
+    # AR variant of the tail fusion: "spin" (default, single kernel) / "hccl"
+    # (fused fin+add + stock HCCL all-reduce + stock A3a norm)
+    SGLANG_NPU_MOE_TAIL_FUSION_AR = EnvStr("spin")
+    # Log guard misses / init results once per key
+    SGLANG_NPU_MOE_TAIL_FUSION_DEBUG = EnvBool(False)
     # full_attention decode fusion master switch (A1b split+KV scatter /
     # A2 sigmoid_mul / A3a add_gemma_rms_norm, hardware_backend/npu/attention/
     # full_attention_fusion_npu.py); DEBUG=1 logs per-layer guard misses

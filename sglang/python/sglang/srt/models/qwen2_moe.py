@@ -112,6 +112,14 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+# FUSED_TAIL: MoE layer-tail fin+add+AR+norm fusion. When the wrapper is
+# missing the fusion stays inactive (bare-import fallback so the service can
+# always start).
+try:
+    from sglang.srt.hardware_backend.npu import tp_fused_tail_npu as _tp_fused_tail
+except ImportError:
+    _tp_fused_tail = None
+
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
@@ -476,7 +484,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
+    def _forward_router_experts(self, hidden_states: torch.Tensor, deferred: bool = False):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
@@ -484,12 +492,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
-        return self.experts(hidden_states, topk_output)
+        if not deferred:
+            return self.experts(hidden_states, topk_output)
+        # FUSED_TAIL deferred: dispatch + experts GMM run as usual; the stock
+        # finalize inside forward_npu is skipped and the pre-finalize pieces
+        # (xexp/eri/scales_fp32) go up to the fusion kernel.
+        moe = self.experts
+        dispatch_output = moe.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+        return moe.quant_method.forward_npu(moe, dispatch_output, deferred=True)
 
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
+        deferred: bool = False,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
@@ -500,7 +518,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # 依赖边不变（alt 仍只等 pre-MoE 主流点，汇合仍 main 等 alt），
         # 两支对 hidden_states 均只读、clone 仍在主流——数值逐位等价。
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(hidden_states, deferred=deferred)
 
         shared_output = (
             self._forward_shared_experts(
@@ -553,6 +571,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not is_npu()
         )
 
+        # FUSED_TAIL: deferred pre-decision. Passing the gate means the stock
+        # finalize/add/AR are skipped for the fused chain (no fallback — the
+        # gate must cover every prerequisite of finish, see
+        # tp_fused_tail_npu.fused_tail_gate). Always False when the wrapper is
+        # missing, the LoRA staged-add experiment is on, the post-experts AR
+        # is moved out of this block (reduce_scatter / allreduce-fusion
+        # configs — the fused chain would double the AR), or the
+        # shape/dtype/backend guards miss. Decode-only: the fused ops'
+        # benefit/validation domain is decode-size M; prefill/extend takes
+        # the stock chain.
+        use_fused_tail = (
+            _tp_fused_tail is not None
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not should_skip_post_experts_all_reduce(
+                is_tp_path=True,
+                use_reduce_scatter=use_reduce_scatter,
+                should_allreduce_fusion=should_allreduce_fusion,
+            )
+            and not get_moe_a2a_backend().is_flashinfer()
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode()
+            and _tp_fused_tail.fused_tail_gate(self, hidden_states)
+        )
+
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
             # (which crash on empty tensors in FP4 GEMM), but still call
@@ -562,13 +604,29 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
         elif self.alt_stream is not None and get_is_capture_mode():
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states, use_fused_gate=use_fused_gate
+                hidden_states, use_fused_gate=use_fused_gate, deferred=use_fused_tail
             )
         else:
             shared_output = self._forward_shared_experts(
                 hidden_states, apply_gate=not use_fused_gate
             )
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            final_hidden_states = self._forward_router_experts(
+                hidden_states, deferred=use_fused_tail
+            )
+
+        if use_fused_tail:
+            # Fused chain (fin+add+AR+norm): spin returns the norm_out
+            # carrier with ctx attached (the launch is deferred to the next
+            # GemmaRMSNorm.forward_npu); hccl returns the AR-completed hidden
+            # (the stock A3a norm consumes it as usual).
+            return _tp_fused_tail.fused_tail_finish(
+                self,
+                final_hidden_states,
+                shared_output,
+                residual=getattr(self, "_sglang_fused_tail_residual", None),
+                num_tokens=num_tokens,
+                hidden_dim=hidden_dim,
+            )
 
         if shared_output is not None:
             if use_fused_gate:

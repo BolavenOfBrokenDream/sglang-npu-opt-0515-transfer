@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -227,8 +227,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return F.linear(x, layer.weight, bias)
 
 
+class FusedTailPieces(NamedTuple):
+    """Pre-finalize MoE pieces for the FUSED_TAIL deferred path (see
+    hardware_backend/npu/tp_fused_tail_npu.py): xexp = post-GMM2 expert
+    outputs in expanded order [M*K, H] bf16; eri = flat-slot (t*top_k+k) ->
+    expanded-row index int32 [M*K]; scales_fp32 = pre-cast topk weights
+    (fp32 on the NPU topk contract)."""
+
+    xexp: torch.Tensor
+    eri: torch.Tensor
+    scales_fp32: torch.Tensor
+
+
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
+
+    # Same-batch deployment marker for the FUSED_TAIL gate: this method can
+    # produce deferred pre-finalize pieces via forward_npu(deferred=True).
+    fused_tail_deferred_supported = True
 
     def __init__(
         self,
@@ -731,12 +747,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self,
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
+        deferred: bool = False,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
 
         if DispatchOutputChecker.format_is_deepep(dispatch_output):
+            if deferred:
+                raise RuntimeError(
+                    "fused_tail: the deferred path is incompatible with deepep dispatch"
+                )
             return self._forward_npu_deepep(layer, dispatch_output)
 
         # x.shape = [B*S, H]
@@ -744,6 +765,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # topk_weights.shape = [B*S, K]; topk_ids.shape = [B*S, K]
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
+        # FUSED_TAIL: keep the pre-cast scales reference for the deferred path
+        # (fp32 on the NPU topk contract; the stock finalize consumes the bf16
+        # cast below, so the fused side is strictly no worse).
+        topk_weights_raw = topk_weights
         original_dtype = x.dtype
         num_tokens = x.shape[0]
         topk_weights = topk_weights.to(x.dtype)
@@ -850,6 +875,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 group_list=expert_tokens,
                 output_dtype=original_dtype,
             )[0]
+
+        if deferred:
+            # FUSED_TAIL (MoE layer-tail fusion): skip the stock finalize and
+            # hand the pre-finalize pieces up to qwen2_moe's fused chain
+            # (fin+add+AR+norm). expanded_row_idx is the flat-slot
+            # (t*top_k+k) -> expanded-row index for both init-routing arms
+            # above (v22 is bitwise-identical to stock v2), exactly the fused
+            # kernel's eri contract.
+            if expanded_row_idx.dtype != torch.int32:
+                expanded_row_idx = expanded_row_idx.to(torch.int32)
+            return FusedTailPieces(
+                xexp=hidden_states,
+                eri=expanded_row_idx.contiguous(),
+                scales_fp32=topk_weights_raw,
+            )
 
         final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
             hidden_states,

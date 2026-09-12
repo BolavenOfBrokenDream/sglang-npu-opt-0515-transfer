@@ -204,6 +204,14 @@ if _is_npu:
         tp_sigmoid_mul_mm_shape_supported,
     )
 
+# FUSED_TAIL: MoE layer-tail fin+add+AR+norm fusion. When the wrapper is
+# missing the fusion stays inactive (bare-import fallback so the service can
+# always start).
+try:
+    from sglang.srt.hardware_backend.npu import tp_fused_tail_npu as _tp_fused_tail
+except ImportError:
+    _tp_fused_tail = None
+
 
 def _gdn_qkvzba_packable(proj_qkvz, proj_ba) -> bool:
     """Runtime guard for GDN_QKVZBA_PACK (any failure -> fall back to two GEMMs).
@@ -895,6 +903,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            # FUSED_TAIL (spin variant): stash residual for the MoE block's
+            # fused tail (the kernel's add-residual input; spin only, cheap
+            # attribute write; the hccl variant and the stock path ignore it).
+            if _tp_fused_tail is not None and _tp_fused_tail.fused_tail_spin_stash_enabled():
+                self.mlp._sglang_fused_tail_residual = residual
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
@@ -1449,6 +1462,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            # FUSED_TAIL (spin variant): stash residual for the MoE block's
+            # fused tail (the kernel's add-residual input; spin only, cheap
+            # attribute write; the hccl variant and the stock path ignore it).
+            if _tp_fused_tail is not None and _tp_fused_tail.fused_tail_spin_stash_enabled():
+                self.mlp._sglang_fused_tail_residual = residual
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
@@ -2016,6 +2034,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        # FUSED_TAIL (spin variant): symmem context init (collective + warmup,
+        # must happen before graph capture; idempotent, failure disables the
+        # fusion with a log). After weight loading = all TP ranks aligned.
+        if _tp_fused_tail is not None:
+            _tp_fused_tail.maybe_init_fused_tail_spin(
+                hidden_size=self.config.hidden_size
+            )
         return loaded_params
 
 
@@ -2172,6 +2197,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                     weight_loader(param_lm_head, loaded_weight)
             loaded_params.add(name)
+
+        # FUSED_TAIL (spin variant): symmem context init. The VL wrapper
+        # classes' load_weights do not go through the inner CausalLM one, so
+        # each VL class needs the same (idempotent) hook at its end, otherwise
+        # _require_spin_ctx fails loudly at capture time.
+        if _tp_fused_tail is not None:
+            _tp_fused_tail.maybe_init_fused_tail_spin(
+                hidden_size=getattr(
+                    self.config, "text_config", self.config
+                ).hidden_size
+            )
         return loaded_params
 
 
@@ -2549,6 +2585,16 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             }
         )
 
+        # FUSED_TAIL (spin variant): symmem context init. The VL wrapper
+        # classes' load_weights do not go through the inner CausalLM one, so
+        # each VL class needs the same (idempotent) hook at its end, otherwise
+        # _require_spin_ctx fails loudly at capture time.
+        if _tp_fused_tail is not None:
+            _tp_fused_tail.maybe_init_fused_tail_spin(
+                hidden_size=getattr(
+                    self.config, "text_config", self.config
+                ).hidden_size
+            )
         return loaded_params
 
     @property

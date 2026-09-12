@@ -19,6 +19,7 @@
 #include "causal_conv1d/op_host/causal_conv1d.h"
 #include "fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.h"
 #include "fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.h"
+#include "fused_tail/op_host/fused_tail.h"
 
 namespace {
 TORCH_LIBRARY_FRAGMENT(npu, m)
@@ -169,6 +170,25 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor(a!) initial_state_source, Tensor initial_state_indices, "
         "float scale, Tensor cu_seqlens, bool use_qk_l2norm, "
         "int q_row_stride, int k_row_stride, int v_row_stride) -> Tensor");
+
+    // MoE layer-tail fin+add+AR+norm fusion (three ops):
+    // fused_fin_ar_norm = spin AIV AR single-kernel variant (addr_tab
+    // int64[>=18] carries symmem/cell VAs; eri_va/norm_w_va are graph-static
+    // addresses baked into tiling at capture);
+    // fused_fin_add = fin(+skip1) local front stage (stock HCCL AR variant,
+    // no symmem); fused_tail_zero = flag symmem MTE3 clearing (init/reset).
+    m.def(
+        "fused_fin_ar_norm(Tensor x, Tensor scales, Tensor skip1, Tensor residual, "
+        "Tensor(a!) add_out, Tensor(b!) norm_out, Tensor addr_tab, "
+        "int eri_va, int norm_w_va, "
+        "int m, int h, int k, int ncores, int rank, int world, "
+        "int has_skip1, int use_eri, float eps, int cycle_limit_us, "
+        "int slot_stride, int ring_stride, int max_tiles, "
+        "int counter_offset, int dfx_offset) -> ()");
+    m.def(
+        "fused_fin_add(Tensor x, Tensor scales, Tensor skip1, Tensor(a!) out, "
+        "int eri_va, int m, int h, int k, int ncores, int has_skip1, int use_eri) -> ()");
+    m.def("fused_tail_zero(Tensor(a!) x, int nbytes, int ncores) -> ()");
 }
 }  // namespace
 
@@ -288,5 +308,10 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
            });
 
     m.impl("fused_sigmoid_gating_recurrent", TORCH_FN(sglang::npu_kernel::fused_sigmoid_gating_recurrent_impl));
+
+    // MoE layer-tail fin+add+AR+norm fusion
+    m.impl("fused_fin_ar_norm", TORCH_FN(sglang::npu_kernel::fused_fin_ar_norm_impl));
+    m.impl("fused_fin_add", TORCH_FN(sglang::npu_kernel::fused_fin_add_impl));
+    m.impl("fused_tail_zero", TORCH_FN(sglang::npu_kernel::fused_tail_zero_impl));
 }
 }  // namespace

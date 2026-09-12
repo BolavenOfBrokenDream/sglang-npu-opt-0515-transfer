@@ -33,6 +33,15 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
+
+# FUSED_TAIL: MoE layer-tail fin+add+AR+norm fusion ctx consumption point (the
+# spin variant's kernel launches inside GemmaRMSNorm.forward_npu — the norm
+# weight is only visible there). When the wrapper is missing the consumption
+# branch stays inactive (bare-import fallback).
+try:
+    from sglang.srt.hardware_backend.npu import tp_fused_tail_npu as _tp_fused_tail
+except ImportError:
+    _tp_fused_tail = None
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -820,6 +829,25 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # FUSED_TAIL (spin variant): when x carries a fused-tail ctx, launch
+        # the fusion kernel (fin+skip1 + spin AR + add + norm single kernel —
+        # the weight is only visible here, hence the deferred launch) and
+        # return (norm_out, add_out), semantically identical to the
+        # add_gemma_rms_norm branch below (normed, new residual). The ctx was
+        # attached to x by qwen2_moe's deferred path; the upstream stock
+        # finalize/add/AR are already skipped, so the launch here is
+        # mandatory (no fallback). post_residual_addition is incompatible
+        # with the fused tail (its value cannot reach the kernel) — fail
+        # loudly.
+        if _tp_fused_tail is not None:
+            fused_ret = _tp_fused_tail.maybe_consume_fused_tail_ctx(x, self)
+            if fused_ret is not None:
+                if post_residual_addition is not None:
+                    raise RuntimeError(
+                        "fused_tail(spin): post_residual_addition is incompatible "
+                        "with the fused layer tail (disable SGLANG_NPU_MOE_TAIL_FUSION)"
+                    )
+                return fused_ret
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
         if residual is not None:
