@@ -353,5 +353,4 @@ TORCH_LIBRARY_IMPL(npu, CompositeExplicitAutograd, m)
 {
     m.impl("vgmm1_query_tile", TORCH_FN(sglang::npu_kernel::vgmm1_query_tile_impl));
 }
-}
 }  // namespace
