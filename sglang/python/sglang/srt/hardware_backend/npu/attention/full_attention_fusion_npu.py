@@ -5,9 +5,9 @@
 #       cache; returned k/v are None (cache already written — the caller must
 #       skip set_kv_buffer).
 #   A2  fa_sigmoid_mul：sigmoid(gate)*attn 融合单 kernel（替代 sigmoid+mul_ 两
-#       kernel）；round to bf16 before the multiply, bitwise-identical to
+#       kernel); round to bf16 before the multiply, bitwise-identical to
 #       stock's two-op rounding path.
-#   A3a fa_add_gemma_rms_norm_v2：grid=(batch,) row-parallel; math identical
+#   A3a fa_add_gemma_rms_norm_v2: grid=(batch,) row-parallel; math identical
 #       to stock add_gemma_rms_norm.
 #
 # 数值约定与 sgl_kernel_npu stock 逐字一致：fp32 中间精度、gemma (w+1)、
