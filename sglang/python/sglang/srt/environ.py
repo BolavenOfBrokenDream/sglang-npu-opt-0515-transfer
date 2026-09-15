@@ -574,6 +574,16 @@ class Envs:
     # renorm=1 单算子路由 + v2.2 自写 init_routing，仅作用于无 group/无 bias
     # 的 BF16 路径。默认关，开启：SGLANG_MOE_FRONT_FUSION=1。
     SGLANG_MOE_FRONT_FUSION = EnvBool(False)
+    # GMM1 (w13 gate_up_proj) vendored GMM v1.2 (vgmm1_sched/sched_partial
+    # table-build front op + vgmm1_main scan-free main kernel), BF16 unquant
+    # no-bias path only. With SGLANG_MOE_FRONT_FUSION=1 the routing arm emits
+    # partials and vgmm1_sched_partial absorbs the cumsum node; with FF=0 the
+    # table is built by vgmm1_sched from expert_tokens. Default off.
+    SGLANG_NPU_VGMM1 = EnvBool(False)
+    # Verified domain is small decode M; larger M falls back to stock GMM.
+    SGLANG_NPU_VGMM1_MAX_M = EnvInt(1024)
+    # Log guard misses / counts-vs-table consistency accounts (non-capture only)
+    SGLANG_NPU_VGMM1_DEBUG = EnvBool(False)
     # GMM2（w2 down_proj）走 sgl_kernel_npu.moe.persistent_gmm 的 Triton
     # persistent kernel（默认 stock npu_grouped_matmul）。仅作用于 BF16 无量化
     # 无 bias 路径，开启：SGLANG_GMM2_TRITON=1。

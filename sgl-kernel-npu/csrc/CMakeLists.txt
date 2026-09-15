@@ -36,6 +36,17 @@ FILE(GLOB OP_SRCS
     # kernel / fin+add local front + stock HCCL AR variants + flag symmem
     # MTE3 clearing)
     ${PROJECT_OP_SRC_BASE}/fused_tail/op_host/fused_tail.cpp
+    # VGMM: GMM1 vendored GMM v1.2 (offsets/block-schedule front kernel +
+    # scan-free vendored GMM main kernel; switch SGLANG_NPU_VGMM1).
+    # WARNING: gmm_vendored_v2 (multicore sched, measured regression, direction
+    # abandoned) is blocked — never copy its vgmm_sched_pre_kernel.cpp /
+    # vendored_gmm_sched.cpp / vendored_gmm_host_common.h into this directory;
+    # identical op names would silently shadow v1.
+    ${PROJECT_OP_SRC_BASE}/vendored_gmm/op_host/vendored_gmm.cpp
+    ${PROJECT_OP_SRC_BASE}/vendored_gmm/op_host/vendored_gmm_sched.cpp
+    # C1: vgmm1_sched_partial consumes v22 rank_hist partials, reduces columns
+    # to counts in-kernel and builds the table — the cumsum node is retired.
+    ${PROJECT_OP_SRC_BASE}/vendored_gmm/op_host/vendored_gmm_sched_partial.cpp
     )
 if(BUILD_CATLASS_MODULE)
     list(APPEND OP_SRCS
@@ -170,6 +181,26 @@ ascendc_compile_options(tp_fusion_recurrent_kernel PRIVATE
        --cce-auto-sync=off
 )
 
+# VGMM: GMM1 vendored GMM v1.2, one kernel per file (registration rule:
+# multiple kernels per file + mixed KERNEL_TASK_TYPE registers only the
+# first). vgmm1_main_aic uses the MatmulImpl high-level matmul header
+# (lib/matmul_intf.h, replicating the stock GMM_FLOAT CUBE_ONLY path) and,
+# like stock, needs no --cce-auto-sync pin (no handwritten SetFlag/WaitFlag in
+# the kernel; all sync lives inside TQue/MatmulImpl).
+ascendc_library(vendored_gmm_kernel STATIC
+    ${PROJECT_OP_SRC_BASE}/vendored_gmm/op_kernel/vgmm_sched_pre_kernel.cpp
+    ${PROJECT_OP_SRC_BASE}/vendored_gmm/op_kernel/vgmm_main_kernel.cpp
+    # C1: one kernel per file (registration rule above)
+    ${PROJECT_OP_SRC_BASE}/vendored_gmm/op_kernel/vgmm_sched_partial_pre_kernel.cpp
+)
+ascendc_include_directories(vendored_gmm_kernel PRIVATE
+    ${PROJECT_OP_SRC_BASE}/utils/kernel
+)
+ascendc_compile_definitions(vendored_gmm_kernel PRIVATE
+       -DHAVE_WORKSPACE
+       -DHAVE_TILING
+)
+
 # FUSED_TAIL: three kernels in a dedicated library, --cce-auto-sync=on
 # (matches the probe validation baseline; all sync is handwritten
 # PipeBarrier/SyncFunc pairs, correctness does not rely on auto-sync).
@@ -221,6 +252,7 @@ target_link_libraries(${OP_PLUGIN_NAME} PRIVATE
         no_workspace_kernel
         tp_fusion_kernel
         tp_fusion_recurrent_kernel
+        vendored_gmm_kernel
         fused_tail_kernel
         torch_npu
         ascendcl
@@ -246,6 +278,8 @@ target_include_directories(${OP_PLUGIN_NAME} PRIVATE
         ${PROJECT_OP_SRC_BASE}/causal_conv1d/op_host
         ${PROJECT_OP_SRC_BASE}/fused_qkvzba_conv1d/op_host
         ${PROJECT_OP_SRC_BASE}/fused_sigmoid_gating_recurrent/op_host
+        ${PROJECT_OP_SRC_BASE}/vendored_gmm/op_host
+        ${PROJECT_OP_SRC_BASE}/vendored_gmm/op_host/stub
         ${PROJECT_OP_SRC_BASE}/fused_tail/op_host
         ${PROJECT_OP_SRC_BASE}/fused_tail/op_host/stub
         ${TORCH_DIR}/include

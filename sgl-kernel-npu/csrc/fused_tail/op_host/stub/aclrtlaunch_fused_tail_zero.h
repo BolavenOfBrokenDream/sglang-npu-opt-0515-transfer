@@ -1,7 +1,7 @@
-// fused_tail: aclrtlaunch declaration for fused_tail_zero (handwritten stub,
-// same convention as fused_qkvzba_conv1d; fallback when auto_gen is absent —
-// signature matches the kernel entry parameter by parameter, workspace slot is
-// a dummy position).
+// fused_tail (tp_ascendc_fusion_v4.1): aclrtlaunch declaration for fused_tail_zero
+// (follows fused_qkvzba_conv1d's handwritten stub convention; fallback when
+// auto_gen does not emit it — signature matches the kernel entry parameter by
+// parameter, workspace slot = dummy parameter position).
 #ifndef HEADER_ACLRTLAUNCH_CUSTOM_FUSED_TAIL_ZERO_H
 #define HEADER_ACLRTLAUNCH_CUSTOM_FUSED_TAIL_ZERO_H
 #include "acl/acl_base.h"

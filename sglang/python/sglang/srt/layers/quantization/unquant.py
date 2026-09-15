@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,46 @@ _moe_front_fusion = envs.SGLANG_MOE_FRONT_FUSION.get()
 # persistent kernel（默认 stock，开启：SGLANG_GMM2_TRITON=1）。仅作用于
 # BF16 无量化无 bias 路径。
 _gmm2_triton = envs.SGLANG_GMM2_TRITON.get()
+# VGMM1: GMM1 (w13 gate_up_proj) via the vendored GMM v1.2 ops registered by
+# the rebuilt sgl_kernel_npu wheel — vgmm1_sched / vgmm1_sched_partial (AIV
+# single-core front op: counts/partials -> block-schedule table) + vgmm1_main
+# (AIC main kernel, scan-free table lookup). Unquant BF16 no-bias w13 path
+# only. Default off: SGLANG_NPU_VGMM1=1.
+_vgmm1 = envs.SGLANG_NPU_VGMM1.get()
+# The on-machine verified domain is small decode M; larger M (prefill) is
+# unverified and falls back to stock. Default 1024 covers decode bs<=128 x
+# topk8 — raise only after re-running large-M T0/T1/T2.
+_vgmm1_max_m = envs.SGLANG_NPU_VGMM1_MAX_M.get()
+# Diagnostics: log guard misses and the counts-vs-table consistency account
+# (skipped during graph capture — device sync is illegal there).
+_vgmm1_debug = envs.SGLANG_NPU_VGMM1_DEBUG.get()
+# Host-side staged-verification knob read per call by the csrc host; the
+# wrapper only needs to recognize 6 (host sentinel tier over-returns y, which
+# is sliced back to [total_m, n] here). All other tiers are wrapper-agnostic.
+_vgmm1_stage = os.environ.get("VGMM_STAGE", "")
+
+
+def _vgmm1_is_capturing() -> bool:
+    try:
+        return bool(torch.npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+# vgmm1_query_tile is a pure host query (no kernel launch, CPU tensor out);
+# cache baseM/baseN per (m, k, n) — decode graph shapes are fixed, computed
+# once at capture, zero device sync, capture-safe.
+_vgmm1_tile_cache: Dict[tuple, tuple] = {}
+
+
+def _vgmm1_tile(m: int, k: int, n: int):
+    key = (m, k, n)
+    tile = _vgmm1_tile_cache.get(key)
+    if tile is None:
+        qt = torch.ops.npu.vgmm1_query_tile(m, k, n)
+        tile = (int(qt[0]), int(qt[1]))
+        _vgmm1_tile_cache[key] = tile
+    return tile
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -771,7 +812,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_weights_raw = topk_weights
         original_dtype = x.dtype
         num_tokens = x.shape[0]
-        topk_weights = topk_weights.to(x.dtype)
+        # v4.1: the bf16 cast is dead on the deferred path (the pieces carry
+        # the raw reference and the fused kernels widen scales in-kernel), so
+        # issue it only where the stock finalize actually consumes it.
+        if not deferred:
+            topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
         num_experts = layer.num_experts
         top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
@@ -779,6 +824,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         m = num_tokens * top_k
         h = x.shape[1]
         expert_offsets = None
+        # C1 table triple: when the front arm below takes the v22_partials
+        # path, vgmm1_sched_partial emits the block-schedule table right here
+        # and the w13 vgmm1 branch skips its vgmm1_sched node (the Triton
+        # partials_cumsum node leaves the chain entirely).
+        vgmm1_block_table = None
+        vgmm1_total_blocks = None
+        vgmm1_table_n = None
         if (
             _moe_front_fusion
             and m <= 512
@@ -790,12 +842,49 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             # 六轮单测 0 容差逐位验收）：语义与 npu_moe_init_routing_v2(type=1)
             # 逐位一致，并原生输出 exclusive offsets（int32 [E]）供 persistent
             # GMM2 offsets= 直用。形态门外回退 stock v2。
-            from sgl_kernel_npu.moe.moe_front_routing import moe_init_routing_v22
-
-            hidden_states, expanded_row_idx, expert_tokens, excl, _incl = (
-                moe_init_routing_v22(x, topk_ids, num_experts, top_k)
+            c1 = (
+                _vgmm1
+                and not self.with_bias
+                and m <= _vgmm1_max_m
+                # day-0 gate: a wheel without vgmm1_sched_partial falls back
+                # to the v22 five-tuple arm (the w13 branch then builds the
+                # table via vgmm1_sched — behavior identical to pre-C1).
+                and hasattr(torch.ops.npu, "vgmm1_sched_partial")
             )
-            expert_offsets = excl
+            if c1:
+                # C1: rank_hist + gather two launches (cumsum node retired),
+                # partials handed to the AscendC vgmm1_sched_partial which does
+                # the column reduction (counts/excl) and the table build in one
+                # pass. max_blocks upper bound = m + E (same convention as the
+                # w13 branch's total_m + num_experts).
+                from sgl_kernel_npu.moe.moe_front_routing import (
+                    moe_init_routing_v22_partials,
+                )
+
+                _n13 = layer.w13_weight.shape[1]
+                _k13 = layer.w13_weight.shape[2]
+                _base_m, _base_n = _vgmm1_tile(m, _k13, _n13)
+                hidden_states, expanded_row_idx, partials = (
+                    moe_init_routing_v22_partials(x, topk_ids, num_experts, top_k)
+                )
+                (
+                    vgmm1_block_table,
+                    excl,
+                    vgmm1_total_blocks,
+                    expert_tokens,
+                ) = torch.ops.npu.vgmm1_sched_partial(
+                    partials, num_experts, m, _n13, _k13,
+                    m + num_experts, _base_m, _base_n,
+                )
+                vgmm1_table_n = _n13
+                expert_offsets = excl
+            else:
+                from sgl_kernel_npu.moe.moe_front_routing import moe_init_routing_v22
+
+                hidden_states, expanded_row_idx, expert_tokens, excl, _incl = (
+                    moe_init_routing_v22(x, topk_ids, num_experts, top_k)
+                )
+                expert_offsets = excl
         else:
             hidden_states, expanded_row_idx, expert_tokens, _ = (
                 torch.ops.npu.npu_moe_init_routing_v2(
@@ -814,16 +903,124 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         w2_bias = [layer.w2_weight_bias] if self.with_bias else None
 
         # gmm1: gate_up_proj
-        hidden_states = torch.ops.npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[layer.w13_weight.transpose(1, 2)],
-            bias=w13_bias,
-            split_item=2,
-            group_list_type=1,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-        )[0]
+        _w13 = layer.w13_weight
+        _total_m = hidden_states.shape[0]
+        # Guards only read tensor attributes/static shapes — graph-capture
+        # safe; a miss falls back to stock silently (an NZ/non-contiguous w13
+        # is structurally rejected by is_contiguous()).
+        if (
+            _vgmm1
+            and w13_bias is None
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and _w13.dtype == torch.bfloat16
+            and _w13.dim() == 3
+            and _w13.is_contiguous()
+            and _w13.shape[2] == hidden_states.shape[1]
+            and expert_tokens.dtype == torch.int64
+            and expert_tokens.is_contiguous()
+            and 0 < _total_m <= _vgmm1_max_m
+        ):
+            # One-shot forensics print (host metadata, no device sync,
+            # capture-safe): contract = w13 [E, N, K] ND contiguous (fmt=0);
+            # fmt=29 (FRACTAL_NZ) means the layout is broken — check this line
+            # first when debugging.
+            try:
+                import torch_npu as _torch_npu
+
+                _w13_fmt = _torch_npu.get_npu_format(_w13)
+            except Exception:
+                _w13_fmt = "unknown"
+            logger.warning_once(
+                f"[VGMM1] w13 fmt={_w13_fmt}(0=ND,29=NZ) "
+                f"shape={tuple(_w13.shape)} contig={_w13.is_contiguous()} "
+                f"dtype={_w13.dtype} | x shape={tuple(hidden_states.shape)} "
+                f"dtype={hidden_states.dtype} contig={hidden_states.is_contiguous()} "
+                f"| counts shape={tuple(expert_tokens.shape)} "
+                f"dtype={expert_tokens.dtype} | total_m={_total_m}"
+            )
+            _e, _n, _k = _w13.shape
+            # baseM/baseN: same cached host query as the front arm (same key,
+            # same inputs) so the table build and the main kernel's read agree.
+            _base_m, _base_n = _vgmm1_tile(_total_m, _k, _n)
+            if (
+                vgmm1_block_table is not None
+                and vgmm1_total_blocks is not None
+                and vgmm1_table_n == _n
+            ):
+                # C1: the front arm's vgmm1_sched_partial already emitted the
+                # table (bitwise-identical to vgmm1_sched, UT-exhaustive
+                # checked) — the sched node is skipped entirely. A table_n
+                # mismatch refuses this branch and rebuilds via sched: a
+                # derivation error costs performance, never correctness.
+                _block_table, _total_blocks = (
+                    vgmm1_block_table,
+                    vgmm1_total_blocks,
+                )
+            else:
+                # max_blocks upper bound = total_m + E (per non-empty group
+                # blocks <= ceil(m/baseM) <= m/baseM + 1, total <=
+                # total_m/baseM + E).
+                _block_table, _row_offsets, _total_blocks = (
+                    torch.ops.npu.vgmm1_sched(
+                        expert_tokens,
+                        _total_m,
+                        _n,
+                        _k,
+                        _total_m + _e,
+                        _base_m,
+                        _base_n,
+                    )
+                )
+            if _vgmm1_debug and not _vgmm1_is_capturing():
+                # Diagnostic sync point (reached only in warmup/eager; skipped
+                # under capture). The sched table's row ranges are clamped to
+                # sum(counts), so max_write_end > total_m implies counts/table
+                # vs x row-count inconsistency; == total_m means the table is
+                # clean and any OOB lives in the main kernel itself.
+                _sum = int(expert_tokens.sum())
+                _tb = int(_total_blocks[0])
+                _t = _block_table.view(-1, 8)[:_tb].to(torch.int64)
+                _max_end = (
+                    int((_t[:, 1] + _t[:, 2] * _base_m + _t[:, 4]).max())
+                    if _tb > 0
+                    else 0
+                )
+                logger.warning(
+                    f"[VGMM1_DBG] total_m={_total_m} sum={_sum} "
+                    f"min={int(expert_tokens.min())} "
+                    f"max={int(expert_tokens.max())} "
+                    f"numel={expert_tokens.numel()} blocks={_tb} "
+                    f"max_write_end={_max_end} "
+                    f"base_m={_base_m} base_n={_base_n}"
+                )
+            _y = torch.ops.npu.vgmm1_main(
+                hidden_states, _w13, _block_table, _total_blocks
+            )
+            if _vgmm1_stage == "6":
+                # Host sentinel tier over-returns guard rows; slice back.
+                _y = _y[:_total_m]
+            hidden_states = _y
+        else:
+            if _vgmm1 and w13_bias is None:
+                logger.warning_once(
+                    f"[VGMM1] guard miss, fallback to stock npu_grouped_matmul: "
+                    f"x(dtype={hidden_states.dtype},contig={hidden_states.is_contiguous()}) "
+                    f"w13(shape={tuple(_w13.shape)},dtype={_w13.dtype},"
+                    f"contig={_w13.is_contiguous()}) "
+                    f"counts(dtype={expert_tokens.dtype}) total_m={_total_m} "
+                    f"max_m={_vgmm1_max_m}"
+                )
+            hidden_states = torch.ops.npu.npu_grouped_matmul(
+                x=[hidden_states],
+                weight=[layer.w13_weight.transpose(1, 2)],
+                bias=w13_bias,
+                split_item=2,
+                group_list_type=1,
+                group_type=0,
+                group_list=expert_tokens,
+                output_dtype=original_dtype,
+            )[0]
 
         # act_fn:
         if self.moe_runner_config.activation == "npu_swiglu_oai":

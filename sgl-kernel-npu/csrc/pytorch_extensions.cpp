@@ -19,6 +19,9 @@
 #include "causal_conv1d/op_host/causal_conv1d.h"
 #include "fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.h"
 #include "fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.h"
+// VGMM: GMM1 vendored GMM v1.2 (production decode w13 path, SGLANG_NPU_VGMM1)
+#include "vendored_gmm/op_host/vendored_gmm.h"
+// FUSED_TAIL: MoE layer-tail fin+add+AR+norm fusion
 #include "fused_tail/op_host/fused_tail.h"
 
 namespace {
@@ -173,22 +176,39 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
 
     // MoE layer-tail fin+add+AR+norm fusion (three ops):
     // fused_fin_ar_norm = spin AIV AR single-kernel variant (addr_tab
-    // int64[>=18] carries symmem/cell VAs; eri_va/norm_w_va are graph-static
-    // addresses baked into tiling at capture);
+    // int64[>=18] carries symmem/cell VAs; v4.1: eri/norm_w are tensor
+    // parameters — v4's tiling VAs put addresses in the tiling hash and
+    // dragged a per-layer copy chain into the graph; scales accepts
+    // fp32/bf16);
     // fused_fin_add = fin(+skip1) local front stage (stock HCCL AR variant,
     // no symmem); fused_tail_zero = flag symmem MTE3 clearing (init/reset).
     m.def(
         "fused_fin_ar_norm(Tensor x, Tensor scales, Tensor skip1, Tensor residual, "
         "Tensor(a!) add_out, Tensor(b!) norm_out, Tensor addr_tab, "
-        "int eri_va, int norm_w_va, "
+        "Tensor eri, Tensor norm_w, "
         "int m, int h, int k, int ncores, int rank, int world, "
         "int has_skip1, int use_eri, float eps, int cycle_limit_us, "
         "int slot_stride, int ring_stride, int max_tiles, "
         "int counter_offset, int dfx_offset) -> ()");
     m.def(
         "fused_fin_add(Tensor x, Tensor scales, Tensor skip1, Tensor(a!) out, "
-        "int eri_va, int m, int h, int k, int ncores, int has_skip1, int use_eri) -> ()");
+        "Tensor eri, int m, int h, int k, int ncores, int has_skip1, int use_eri) -> ()");
     m.def("fused_tail_zero(Tensor(a!) x, int nbytes, int ncores) -> ()");
+
+    // VGMM: GMM1 vendored GMM v1.2 (gmm1_vendored_gmm; production decode w13
+    // path, switch SGLANG_NPU_VGMM1)
+    m.def(
+        "vgmm1_sched(Tensor group_list, int total_m, int n, int k, int max_blocks, int base_m=-1, "
+        "int base_n=-1) -> (Tensor, Tensor, Tensor)");
+    m.def("vgmm1_main(Tensor x, Tensor w, Tensor block_table, Tensor total_blocks) -> Tensor");
+    m.def("vgmm1_query_tile(int m, int k, int n) -> Tensor");
+    // C1: sched absorbs the cumsum — input = v22 rank_hist partials
+    // int32[partNum, partStride], output = (block_table, row_offsets,
+    // total_blocks, counts int64[E]); the Triton partials_cumsum node is
+    // retired from the chain.
+    m.def(
+        "vgmm1_sched_partial(Tensor partials, int num_experts, int total_m, int n, int k, int max_blocks, "
+        "int base_m=-1, int base_n=-1) -> (Tensor, Tensor, Tensor, Tensor)");
 }
 }  // namespace
 
@@ -313,5 +333,25 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("fused_fin_ar_norm", TORCH_FN(sglang::npu_kernel::fused_fin_ar_norm_impl));
     m.impl("fused_fin_add", TORCH_FN(sglang::npu_kernel::fused_fin_add_impl));
     m.impl("fused_tail_zero", TORCH_FN(sglang::npu_kernel::fused_tail_zero_impl));
+
+    // VGMM: GMM1 vendored GMM v1.2 (production decode w13 path)
+    m.impl("vgmm1_sched", TORCH_FN(sglang::npu_kernel::vgmm1_sched_impl));
+    m.impl("vgmm1_main", TORCH_FN(sglang::npu_kernel::vgmm1_main_impl));
+    // C1: sched absorbs the cumsum, consuming v22 rank_hist partials
+    m.impl("vgmm1_sched_partial", TORCH_FN(sglang::npu_kernel::vgmm1_sched_partial_impl));
+}
+}  // namespace
+
+namespace {
+// vgmm1_query_tile takes three ints and no Tensor: the dispatcher cannot
+// compute a backend key and a PrivateUse1 kernel would never route (it would
+// report "no fallback function is registered"). It is a pure host query with
+// no autograd needs, so register it under the CompositeExplicitAutograd
+// catchall (same default landing spot as an inline m.def lambda — reachable
+// even without Tensor arguments).
+TORCH_LIBRARY_IMPL(npu, CompositeExplicitAutograd, m)
+{
+    m.impl("vgmm1_query_tile", TORCH_FN(sglang::npu_kernel::vgmm1_query_tile_impl));
+}
 }
 }  // namespace

@@ -17,26 +17,30 @@
 
 /*!
  * \file fused_fin_add_kernel.cpp
- * \brief fused_fin_add = finalize(+skip1) local front stage (first half of the
- *        "fin+add fusion + stock HCCL AR + A3a norm" variant; productionized
- *        from probe oar_p8_fin_add_db). One kernel per file
+ * \brief fused_fin_add = finalize(+skip1) local front stage
+ *        (tp_ascendc_fusion_v4.1 production op, first half of the "fin+add
+ *        fusion + stock HCCL AR + A3a norm" route; productionized port of
+ *        probe oar_p8_fin_add_db). One kernel per file
  *        (KERNEL_TYPE_AIV_ONLY).
  *
  * Duty: fp32-accumulate the local contribution rows (TailFinDbFront double
  * buffering, numerically bit-identical to fused_fin_ar_norm's serial front
  * stage) -> single CAST_RINT to bf16 (stock finalize output point) -> write
- * out [M,H]. No AR, no norm, no symmem — the caller chains
- * tensor_model_parallel_all_reduce(out) + stock A3a norm to form the
- * "same fin+add fusion, AR over stock HCCL" variant (better than spin for
- * M>=64 per probe r24).
+ * out [M,H]. **No AR, no norm, no symmem** — the caller chains
+ * tensor_model_parallel_all_reduce(out) + stock A3a norm to form the "same
+ * fin+add fusion, AR over stock HCCL" variant (this variant beats the spin
+ * version in the M>=64 regime, probe r24 decision).
  * Row-granular core split (mIdx = core_, core_+C, ...); no tile/flag/ring
  * concept, no cross-core sync.
  *
- * use_eri=1 (production): x=xp unpermuted, row address = eri[m*K+k]*h (eri VA
- * via tiling.eri_va); use_eri=0: x already laid out (UT reference arm).
+ * use_eri=1 (production form): x=xp unpermuted, row address = eri[m*K+k]*h
+ * ([v4.1] eri arrives via tensor parameter); use_eri=0: x already laid out
+ * (UT reference arm).
+ * [v4.1] scales supports direct bf16 feeding (tiling.scales_bf16, exact UB
+ * Cast widening).
  *
  * UB budget (per core, worst H4096: row 8KB): finAccF 16 + xQueue 2x8=16
- *   + skip1Queue 8 + tmpF 16 + outQueue 8 + scales/eri 0.125 = ~64KB << 170KB.
+ *   + skip1Queue 8 + tmpF 16 + outQueue 8 + scales/eri 0.125 ~= 64KB << 170KB.
  * eventID budget (pool 8/class): VECIN slots = xQueue 2 + skip1Queue 1 = 3,
  * headroom 5.
  */
@@ -49,7 +53,7 @@ namespace fused_tail {
 
 class FusedFinAdd {
 public:
-    __aicore__ inline void Init(GM_ADDR xexp, GM_ADDR scales, GM_ADDR skip1, GM_ADDR out,
+    __aicore__ inline void Init(GM_ADDR xexp, GM_ADDR scales, GM_ADDR skip1, GM_ADDR out, GM_ADDR eri,
                                 const FusedTailTilingData *td, TPipe *pipe)
     {
         td_ = td;
@@ -59,7 +63,7 @@ public:
         pipe->InitBuffer(tmpBuf_, h * sizeof(float));
         pipe->InitBuffer(outQueue_, 1, h * sizeof(T));
         tmpF_ = tmpBuf_.Get<float>();
-        fin_.Init(xexp, scales, skip1, td, pipe);
+        fin_.Init(xexp, scales, skip1, eri, td, pipe);
     }
 
     __aicore__ inline void Process()
@@ -95,17 +99,20 @@ using sglang::npu_kernel::FusedTailTilingData;
 using sglang::npu_kernel::fused_tail::FusedFinAdd;
 
 extern "C" __global__ __aicore__ void fused_fin_add(GM_ADDR x, GM_ADDR scales, GM_ADDR skip1, GM_ADDR out,
-                                                    GM_ADDR dummy_workspace, GM_ADDR tiling)
+                                                    GM_ADDR eri, GM_ADDR dummy_workspace, GM_ADDR tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     FusedTailTilingData tilingData;
     kernel_utils::CopyTiling(&tilingData, tiling);
     AscendC::TPipe pipe;
     FusedFinAdd op;
-    // x=xp/xexp [M*K,H] bf16, scales [M,K] fp32, skip1 [M,H] (dummy when
-    // has_skip1=0), out=local contribution [M,H] bf16; dummy_workspace
-    // occupies auto_gen's workspace slot (that slot's argument is corrupted on
-    // arrival — no valid parameter goes there).
-    op.Init(x, scales, skip1, out, &tilingData, &pipe);
+    // x=xp/xexp [M*K,H] bf16, scales [M,K] fp32 or bf16 (tiling.scales_bf16;
+    // bf16 widened exactly in-kernel), skip1 [M,H] (dummy when has_skip1=0),
+    // out=local contribution [M,H] bf16; eri int32[M*K] (dummy when
+    // use_eri=0, kernel does not read it); dummy_workspace occupies
+    // auto_gen's workspace slot (that slot's argument may be corrupted on
+    // arrival at the kernel — unresolved case — so no valid parameter goes
+    // into this slot).
+    op.Init(x, scales, skip1, out, eri, &tilingData, &pipe);
     op.Process();
 }

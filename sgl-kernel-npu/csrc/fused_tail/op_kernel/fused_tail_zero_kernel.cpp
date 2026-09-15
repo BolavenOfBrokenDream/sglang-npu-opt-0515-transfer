@@ -18,17 +18,19 @@
 /*!
  * \file fused_tail_zero_kernel.cpp
  * \brief fused_tail_zero = in-kernel MTE3 zeroing of a local GM region
- *        (productionized from probe oar_p1_bw ZeroOwn). One kernel per file
+ *        (tp_ascendc_fusion_v4.1 production op; productionized port of probe
+ *        oar_p1_bw sub=6/7 ZeroOwn). One kernel per file
  *        (KERNEL_TYPE_AIV_ONLY).
  *
- * Purpose: clearing the local flag symmem at spin-context init/reset. torch
- * zero_() must NOT be used there — an AIV vector write leaves dirty L2 lines
- * on symmem; peer MTE3 writes land in HBM without invalidating the local L2,
- * and a dirty zero line can be evicted and written back at a random later
- * time, erasing a peer flag after it landed (probe first-round spin-timeout
- * root cause). MTE3 writes HBM directly with zero L2 residue, followed by a
- * per-128B-line dcci so the zeros really land (spin MTE2 reads go around L2
- * to HBM).
+ * Purpose: clearing the local flag symmem at spin-context init/reset.
+ * **torch zero_() must NOT be used** — an AIV vector write leaves dirty L2
+ * lines on symmem; peer MTE3 writes land in HBM without invalidating the
+ * local L2, and a dirty zero line can be evicted and written back at a
+ * random later time, possibly after the peer's flag has landed, erasing it
+ * back to 0 (root cause of the probe ut3/ut4 first-round spin timeouts).
+ * MTE3 writes HBM directly with zero L2 residue, plus a per-128B-line dcci
+ * after writing (guarantees the zeros really land, no L2 residue — spin
+ * MTE2 reads go around L2 to HBM).
  */
 
 #include "fused_tail_kernel_lib.h"
@@ -53,7 +55,7 @@ public:
     {
         uint32_t total = td_->total_bytes;
         uint32_t tileBytes = td_->tile_bytes;
-        SyncFunc<HardEvent::V_MTE3>();  // zeroUb_ was written by V(Duplicate), used as MTE3 source
+        SyncFunc<HardEvent::V_MTE3>();  // zeroUb_ is written by V(Duplicate), used as MTE3 source
         uint32_t nTiles = (total + tileBytes - 1U) / tileBytes;
         for (uint32_t t = core_; t < nTiles; t += td_->ncores) {
             uint32_t len = (t + 1U < nTiles) ? tileBytes : (total - t * tileBytes);
@@ -63,7 +65,7 @@ public:
                 reinterpret_cast<__gm__ float *>(base_ + static_cast<uint64_t>(t) * tileBytes));
             DataCopyPad(dst, zeroUb_, extParams);
         }
-        SyncFunc<HardEvent::MTE3_S>();  // dcci only after all zeroing writes complete
+        SyncFunc<HardEvent::MTE3_S>();  // dcci only after all clearing writes complete
         for (uint32_t t = core_; t < nTiles; t += td_->ncores) {
             uint32_t len = (t + 1U < nTiles) ? tileBytes : (total - t * tileBytes);
             uint64_t blk = base_ + static_cast<uint64_t>(t) * tileBytes;
@@ -96,9 +98,10 @@ extern "C" __global__ __aicore__ void fused_tail_zero(GM_ADDR x, GM_ADDR dummy_w
     AscendC::TPipe pipe;
     FusedTailZero op;
     // x = GM region to clear (uint8-view tensor, local flag symmem);
-    // total_bytes via tiling (multiple of 32 guaranteed by host);
-    // dummy_workspace occupies auto_gen's workspace slot (that slot's argument
-    // is corrupted on arrival — no valid parameter goes there).
+    // total_bytes arrives via tiling (multiple of 32 guaranteed by host);
+    // dummy_workspace occupies auto_gen's workspace slot (that slot's
+    // argument may be corrupted on arrival at the kernel — unresolved case —
+    // so no valid parameter goes into this slot).
     op.Init(x, &tilingData, &pipe);
     op.Process();
 }

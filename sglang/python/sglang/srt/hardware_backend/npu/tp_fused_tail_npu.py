@@ -1,5 +1,16 @@
 # MoE layer-tail chain (fin+add+AR+norm) fusion for Qwen3.5-35B-A3B NPU decode,
-# 0515-baseline port of tp_ascendc_fusion_v4. Switch/guard/spin-context module.
+# 0515-baseline port of tp_ascendc_fusion_v4.1. Switch/guard/spin-context module.
+#
+# v4.1 delta (eliminates the per-layer [cast + mem x2] small-op chain ahead of
+# each fused op in graph-mode profiling, ~4.2us x 40 layers/step under v4):
+#   1. eri/norm_w are tensor parameters instead of tiling VA scalars — the
+#      tiling hash degrades to shape-level (all layers share one entry), and
+#      v4's per-layer in-graph tiling H2D+D2D copy pairs shrink to at most one
+#      pair per capture batch size;
+#   2. kernels accept bf16 scales directly (in-kernel exact widening, bitwise
+#      equal to .float()) — the v4 scales.float() fallback (a real per-layer
+#      cast kernel baked into the graph on bf16 topk-output deployments) is
+#      removed, and the deferred path skips the dead topk_weights.to(bf16).
 #
 # Fused chain = the four layer-tail nodes of the production qwen2_moe.py
 # dual-stream path:
@@ -79,7 +90,7 @@ _FT_CELL_BYTES = 128
 _FT_COUNTER_OFFSET = 0
 _FT_DFX_OFFSET = _FT_MAX_CORES * _FT_CELL_BYTES  # 48*128
 _FT_MCELL_BYTES = 2 * _FT_MAX_CORES * _FT_CELL_BYTES
-_FT_EXPECT_BUILD_REV = 20260922  # bump on any kernel change (csrc FUSED_TAIL_BUILD_REV)
+_FT_EXPECT_BUILD_REV = 20260924  # bump on any kernel change (csrc FUSED_TAIL_BUILD_REV)
 
 _FT_OP_CACHE = {}
 _mode_cache = None
@@ -424,7 +435,7 @@ class _SpinContext:
         for _ in range(2 * _FT_RING):
             torch.ops.npu.fused_fin_ar_norm(
                 xp, scales, skip1, res, add_out, norm_out, self.addr_tab,
-                int(eri.data_ptr()), int(norm_w.data_ptr()),
+                eri, norm_w,
                 M, H, K, _FT_NCORES, self.rank, self.world,
                 1, 1, 1e-6, _FT_CYCLE_LIMIT_US,
                 self.slot_stride, self.ring_stride, self.max_tiles,
@@ -614,8 +625,14 @@ def fused_tail_finish(moe_block, pieces, shared_output, residual, num_tokens, hi
         raise RuntimeError("fused_tail: shared_output is None (gate required shared_expert present)")
     m, h = shared_output.shape[0], shared_output.shape[-1]
     k = scales.shape[-1]
-    if scales.dtype != torch.float32:
-        scales = scales.float()  # topk output dtype drift fallback (bf16->fp32 lossless)
+    # v4.1: scales are fed as fp32/bf16 directly (bf16 is widened exactly
+    # in-kernel, bitwise-equal to .float()) — the v4 .float() fallback issued a
+    # real per-layer cast kernel baked into the graph; removed.
+    if scales.dtype not in (torch.float32, torch.bfloat16):
+        raise RuntimeError(
+            f"fused_tail: unexpected scales dtype {scales.dtype} (need fp32 or bf16; "
+            "upstream finalize already skipped, no fallback)"
+        )
     if xp.dtype != torch.bfloat16 or eri.dtype != torch.int32:
         raise RuntimeError(
             f"fused_tail: bad pieces dtype xexp={xp.dtype} eri={eri.dtype} (need bf16/int32)"
@@ -629,7 +646,7 @@ def fused_tail_finish(moe_block, pieces, shared_output, residual, num_tokens, hi
         contrib = torch.empty(m, h, dtype=torch.bfloat16, device=shared_output.device)
         torch.ops.npu.fused_fin_add(
             xp, scales, shared_output, contrib,
-            int(eri.data_ptr()), m, h, k, _FT_NCORES, 1, 1,
+            eri, m, h, k, _FT_NCORES, 1, 1,
         )
         from sglang.srt.distributed import tensor_model_parallel_all_reduce
 
@@ -719,7 +736,7 @@ def maybe_consume_fused_tail_ctx(x, norm_module):
     torch.ops.npu.fused_fin_ar_norm(
         fctx.xexp, fctx.scales, fctx.skip1, fctx.residual,
         fctx.add_out, fctx.norm_out, ctx.addr_tab,
-        int(fctx.eri.data_ptr()), int(w.data_ptr()),
+        fctx.eri, w,
         fctx.m, fctx.h, fctx.k, _FT_NCORES, ctx.rank, ctx.world,
         1, 1, float(norm_module.variance_epsilon), _FT_CYCLE_LIMIT_US,
         ctx.slot_stride, ctx.ring_stride, ctx.max_tiles,

@@ -180,3 +180,50 @@ def moe_init_routing_v22(
                                   NP=npart, NPP=_pow2_ceil(npart), PE=PE,
                                   E=num_experts, num_stages=1)
     return expanded, eri, counts, excl, incl
+
+
+@input_guard
+def moe_init_routing_v22_partials(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+):
+    """C1 variant: rank_hist + gather **two launches**, skipping the
+    partials_cumsum kernel and returning partials instead — the column
+    reduction (counts/excl) and the vgmm1 block-schedule table are both
+    produced downstream by ``torch.ops.npu.vgmm1_sched_partial`` (single-core
+    AscendC), so the cumsum node leaves the chain entirely.
+
+    Called only under the joint gate SGLANG_MOE_FRONT_FUSION=1 &
+    SGLANG_NPU_VGMM1=1; every other path keeps ``moe_init_routing_v22``
+    (five-tuple, byte-identical to FF v1).
+
+    Shape gate identical to v22: M = T*top_k <= 512 and M % 8 == 0; H a power
+    of two; x bf16.
+
+    Returns (expanded_x, eri, partials):
+      expanded_x [M, H] bf16 / eri [M] int32 — bitwise-identical to stock
+        (zero tolerance);
+      partials [npart, PE] int32 — rank_hist's partial histogram
+        (npart = M//bm, bm the largest of {32,16,8} dividing M;
+        PE = pow2_ceil(num_experts)), fed directly into vgmm1_sched_partial
+        (column reduction = counts, exact i32 adds, bitwise-equal to v22).
+    """
+    T, H = x.shape
+    M = T * top_k
+    ids_flat = topk_ids.reshape(-1).to(torch.int32)  # no copy when dtype matches
+    dev = x.device
+    PM = _pow2_ceil(M)
+    PE = _pow2_ceil(num_experts)
+    bm = _pick_tile(M, (32, 16, 8))
+    rpp = _pick_tile(M, (8, 4, 2, 1))
+    npart = M // bm
+    eri = torch.empty(M, dtype=torch.int32, device=dev)
+    partials = torch.empty((npart, PE), dtype=torch.int32, device=dev)
+    expanded = torch.empty((M, H), dtype=x.dtype, device=dev)
+    _rank_hist_kernel[(npart,)](ids_flat, eri, partials,
+                                M=M, PM=PM, PE=PE, BM=bm, num_stages=1)
+    _routing_gather_kernel[(M // rpp,)](x, eri, expanded,
+                                        TOPK=top_k, H=H, RPP=rpp)
+    return expanded, eri, partials
