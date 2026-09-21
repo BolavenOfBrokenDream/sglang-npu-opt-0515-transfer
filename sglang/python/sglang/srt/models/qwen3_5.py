@@ -38,10 +38,13 @@ from sglang.srt.configs.qwen3_5 import (
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 
-# MoE weight L2 prefetch (SGLANG_NPU_MOE_PREFETCH): launched after each layer's
-# prepare_attn, drained at step end; no torch_npu import at module top level, no-op when disabled.
+# MoE weight L2 prefetch (SGLANG_NPU_MOE_PREFETCH): two launch points — "gdn"
+# after prepare_attn and "moe" after prepare_mlp — one single-CMO prefetch of
+# one OPS tensor per point per layer; drained at step end; no torch_npu
+# import at module top level, no-op when disabled.
 from sglang.srt.hardware_backend.npu.moe_weight_prefetch import (
     moe_prefetch_emit,
+    moe_prefetch_emit_moe_entry,
     moe_prefetch_register_model,
     moe_prefetch_step_drain,
 )
@@ -892,6 +895,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+
+        # MoE weight L2 prefetch (moe point): MoE entry, right after the
+        # post-GDN allreduce+norm. With k9 active the MoE head has no
+        # side-stream activity and the segment up to vgmm_sched runs at low
+        # bandwidth, a good spot for a CMO.
+        moe_prefetch_emit_moe_entry(self, hidden_states)
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch

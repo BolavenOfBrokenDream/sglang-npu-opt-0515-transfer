@@ -527,15 +527,21 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # MoE expert weight L2 prefetch (decode aclgraph; see
-    # hardware_backend/npu/moe_weight_prefetch.py)
+    # hardware_backend/npu/moe_weight_prefetch.py). Each launch point fires a
+    # single CMO prefetch of its own OPS tensor with its own budget.
     SGLANG_NPU_MOE_PREFETCH = EnvBool(False)
-    # Comma-separated op list: gmm1 (w13, default) / gmm2 (w2)
-    SGLANG_NPU_MOE_PREFETCH_OPS = EnvStr("gmm1")
-    # auto / full / active; auto == full, active falls back to full with warning
-    SGLANG_NPU_MOE_PREFETCH_MODE = EnvStr("auto")
-    SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB = EnvInt(16)
-    # Per-tensor capacity cap in MiB; 0 = auto (0.8 * queried L2 size)
-    SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB = EnvInt(0)
+    # Comma-separated launch points: "gdn" (layer head, after the input
+    # allreduce / fin_add_ar_norm consumption) and/or "moe" (MoE entry, after
+    # the post-GDN allreduce+norm; requires FRONT_FUSION + k9 active)
+    SGLANG_NPU_MOE_PREFETCH_LAUNCH_POINT = EnvStr("gdn")
+    # Per-point single prefetch target (one OPS per point): gmm1 (w13) / gmm2 (w2)
+    SGLANG_NPU_MOE_PREFETCH_GDN_OPS = EnvStr("gmm1")
+    SGLANG_NPU_MOE_PREFETCH_MOE_OPS = EnvStr("gmm2")
+    # Per-point single-CMO prefetch size in MiB (clamped by the L2 cap below)
+    SGLANG_NPU_MOE_PREFETCH_GDN_BUDGET_MIB = EnvInt(32)
+    SGLANG_NPU_MOE_PREFETCH_MOE_BUDGET_MIB = EnvInt(32)
+    # L2 watermark: per-point prefetch size may not exceed ratio * L2 size
+    SGLANG_NPU_MOE_PREFETCH_L2_CAP_RATIO = EnvFloat(0.7)
     # MoE layer-tail fin+add+AR+norm fusion (master switch; takes effect only
     # when SGLANG_NPU_USE_MULTI_STREAM=1 — the fused add is dual-stream-only;
     # see hardware_backend/npu/tp_fused_tail_npu.py)

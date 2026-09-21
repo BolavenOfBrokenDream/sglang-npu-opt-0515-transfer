@@ -58,6 +58,9 @@ print(hasattr(torch.ops.npu, 'fused_qkvzba_conv1d'), hasattr(torch.ops.npu, 'fus
 
 - 默认开：`SGLANG_NPU_GDN_QKVZBA_PACK`（门控 `_MAX_M=256`）、`SGLANG_NPU_FULL_ATTN_FUSION`（q∈{1,2,4}）
 - 默认关：`SGLANG_NPU_TP_ASCENDC_FUSION`、`SGLANG_NPU_GDN_RECURRENT_ASCENDC`、`SGLANG_NPU_MOE_PREFETCH`、`SGLANG_NPU_EXP_RACE_TRITON`
+- 本分支（qwen35_k9_moe_prefetch）新增，均默认关：
+  - `SGLANG_NPU_MAINSTREAM_SHARED_EXPERT`（k9：shared expert 并入 routed GMM 第 257 槽；仅 `SGLANG_NPU_USE_MULTI_STREAM`+`SGLANG_NPU_VGMM1`+`SGLANG_GMM2_TRITON`+`SGLANG_NPU_MOE_TAIL_FUSION`(spin) 全开时生效，否则 warning 回退）
+  - MoE prefetch v2：`SGLANG_NPU_MOE_PREFETCH_LAUNCH_POINT`（gdn/moe 可同时开，默认 gdn）、每发射点 `..._GDN_OPS`/`..._MOE_OPS`（单 OPS，默认 gmm1/gmm2）、`..._GDN_BUDGET_MIB`/`..._MOE_BUDGET_MIB`（单条 CMO 预取量，默认 32MiB）、`..._L2_CAP_RATIO`（预取量占 L2 上限，默认 0.7）；moe 发射点另需 `SGLANG_MOE_FRONT_FUSION`+k9 开启。旧 `..._OPS`/`..._MODE`/`..._CHUNK_MIB`/`..._BUDGET_MIB` 已删除
 - 全量见 `sglang/python/sglang/srt/environ.py`
 
 已知遗留：现场基线 `ascend_gdn_backend.py` forward_extend 尾部有疑似 patch 残留（未动），extend 段 AttributeError 先查该处。
