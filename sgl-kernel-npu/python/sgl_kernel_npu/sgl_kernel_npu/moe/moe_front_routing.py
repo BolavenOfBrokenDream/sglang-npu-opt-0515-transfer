@@ -90,16 +90,24 @@ def _rank_hist_kernel(
 def _partials_cumsum_kernel(
     part_ptr, counts_ptr, excl_ptr, incl_ptr,
     NP: tl.constexpr, NPP: tl.constexpr, PE: tl.constexpr, E: tl.constexpr,
+    NPB: tl.constexpr,
 ):
     """partials [NP, PE] -> counts(i64) / excl(i32) / incl(i64)，单 program。
 
     全白名单原语：axis=0 二次归约 + 1D tl.cumsum（GDN 生产路径同款）。
+    NP 方向按 NPB≤16 行分块累加：K9 闸内最大 M=504 时 bm=8 ⇒ NP=63、
+    NPP=64，[64,512] i32 整载 = 128KB 超 UB 预算，ConvertLinalgRToBinary /
+    BiShengHIR 编译失败（k9_v22_routing_probe T=56 实证）；分块后单 tile
+    ≤ [16,512] i32 = 32KB（已验证域）。整数加法满足结合律，分块累加与
+    整载逐位一致；NPP≤16 时 NPB=NPP 单趟循环，IR 与旧版等价。
     """
-    np_ = tl.arange(0, NPP)
     rngE = tl.arange(0, PE)
-    part = tl.load(part_ptr + np_[:, None] * PE + rngE[None, :],
-                   mask=(np_ < NP)[:, None], other=0)
-    counts = tl.sum(part, axis=0)                   # [PE] i32
+    counts = tl.zeros((PE,), dtype=tl.int32)
+    for nb in range(0, NPP, NPB):
+        np_ = nb + tl.arange(0, NPB)
+        part = tl.load(part_ptr + np_[:, None] * PE + rngE[None, :],
+                       mask=(np_ < NP)[:, None], other=0)
+        counts += tl.sum(part, axis=0)              # [PE] i32
     incl = tl.cumsum(counts, axis=0)
     excl = incl - counts
     e_valid = rngE < E
@@ -178,7 +186,9 @@ def moe_init_routing_v22(
                                         TOPK=top_k, H=H, RPP=rpp)
     _partials_cumsum_kernel[(1,)](partials, counts, excl, incl,
                                   NP=npart, NPP=_pow2_ceil(npart), PE=PE,
-                                  E=num_experts, num_stages=1)
+                                  E=num_experts,
+                                  NPB=min(_pow2_ceil(npart), 16),
+                                  num_stages=1)
     return expanded, eri, counts, excl, incl
 
 
