@@ -1846,7 +1846,7 @@ _K9_SHARED_EXPERT_WEIGHT_MAPPING = (
 )
 
 
-def _k9_load_shared_expert_weight(name, loaded_weight, params_dict):
+def _k9_load_shared_expert_weight(name, loaded_weight, params_dict, model):
     """Route one standalone shared-expert weight into the appended GMM slot.
 
     Returns the mapped param name, or None when the name is not a
@@ -1854,12 +1854,31 @@ def _k9_load_shared_expert_weight(name, loaded_weight, params_dict):
     standalone MLP params then exist and load as usual). Must run before the
     stacked-params mapping, which would otherwise rewrite gate_proj ->
     gate_up_proj and silently drop these weights when the MLP is not built.
+
+    The appended slot id is a PHYSICAL slot id (the last one by
+    construction), not a logical id: load through the module's physical
+    loader directly. The stock weight_loader treats expert_id as a LOGICAL
+    id whenever the expert-location metadata exists — and the trivial
+    metadata (init_expert_location defaults to "trivial") is always built
+    for this model family — so the appended id is an out-of-bounds logical
+    index there (IndexError at logical_to_all_physical).
     """
     if ".mlp.shared_expert." not in name or ".shared_expert_gate." in name:
         return None
     prefix = name.split(".mlp.shared_expert.")[0]
     if f"{prefix}.mlp.shared_expert.gate_up_proj.weight" in params_dict:
         return None  # standalone shared expert exists — k9 not active here
+
+    def _load_to_appended_slot(param, weight, name_mapped, shard_id):
+        experts = model.get_submodule(name_mapped.rsplit(".", 1)[0])
+        experts._weight_loader_physical(
+            param=param,
+            loaded_weight=weight,
+            weight_name=name_mapped,
+            shard_id=shard_id,
+            expert_id=param.shape[0] - 1,
+        )
+
     if name.endswith(".mlp.shared_expert.gate_up_proj.weight"):
         # Fused gate/up checkpoint tensor: split into the w1/w3 halves.
         gate_w, up_w = loaded_weight.chunk(2, dim=-2)
@@ -1872,13 +1891,8 @@ def _k9_load_shared_expert_weight(name, loaded_weight, params_dict):
                 f"k9: {name_mapped} missing while the standalone shared-expert "
                 "MLP is absent (MoE block built without the extra slot?)"
             )
-        expert_id = param.shape[0] - 1
-        param.weight_loader(
-            param, gate_w, name_mapped, shard_id="w1", expert_id=expert_id
-        )
-        param.weight_loader(
-            param, up_w, name_mapped, shard_id="w3", expert_id=expert_id
-        )
+        _load_to_appended_slot(param, gate_w, name_mapped, "w1")
+        _load_to_appended_slot(param, up_w, name_mapped, "w3")
         return name_mapped
     for proj, expert_param, shard_id in _K9_SHARED_EXPERT_WEIGHT_MAPPING:
         marker = f".mlp.shared_expert.{proj}.weight"
@@ -1891,13 +1905,7 @@ def _k9_load_shared_expert_weight(name, loaded_weight, params_dict):
                 f"k9: {name_mapped} missing while the standalone shared-expert "
                 "MLP is absent (MoE block built without the extra slot?)"
             )
-        param.weight_loader(
-            param,
-            loaded_weight,
-            name_mapped,
-            shard_id=shard_id,
-            expert_id=param.shape[0] - 1,
-        )
+        _load_to_appended_slot(param, loaded_weight, name_mapped, shard_id)
         return name_mapped
     return None
 
@@ -2003,7 +2011,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ):
                 continue
 
-            k9_name = _k9_load_shared_expert_weight(name, loaded_weight, params_dict)
+            k9_name = _k9_load_shared_expert_weight(
+                name, loaded_weight, params_dict, self
+            )
             if k9_name is not None:
                 loaded_params.add(k9_name)
                 continue
@@ -2492,7 +2502,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ):
                 continue
 
-            k9_name = _k9_load_shared_expert_weight(name, loaded_weight, params_dict)
+            k9_name = _k9_load_shared_expert_weight(
+                name, loaded_weight, params_dict, self
+            )
             if k9_name is not None:
                 loaded_params.add(k9_name)
                 continue
