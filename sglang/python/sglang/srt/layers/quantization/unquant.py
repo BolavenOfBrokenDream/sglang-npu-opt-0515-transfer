@@ -82,6 +82,20 @@ _vgmm1_debug = envs.SGLANG_NPU_VGMM1_DEBUG.get()
 _vgmm1_stage = os.environ.get("VGMM_STAGE", "")
 
 
+def _vgmm1_max_m_eff() -> int:
+    """Effective VGMM1 M cap: k9 (K=9) inflates total_m by 9/8 for the same
+    decode bs, so rescale the env's bs128xtopk8 cap when k9 is active. Read
+    lazily — the k9 cache is only valid after MoE block init (extension load
+    + env settled), never at import time."""
+    try:
+        from sglang.srt.hardware_backend.npu import tp_fused_tail_npu as _ft
+    except ImportError:
+        return _vgmm1_max_m
+    if _ft is not None and _ft.k9_mainstream_enabled():
+        return _vgmm1_max_m * 9 // 8
+    return _vgmm1_max_m
+
+
 def _vgmm1_is_capturing() -> bool:
     try:
         return bool(torch.npu.is_current_stream_capturing())
@@ -845,7 +859,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             c1 = (
                 _vgmm1
                 and not self.with_bias
-                and m <= _vgmm1_max_m
+                and m <= _vgmm1_max_m_eff()
                 # day-0 gate: a wheel without vgmm1_sched_partial falls back
                 # to the v22 five-tuple arm (the w13 branch then builds the
                 # table via vgmm1_sched — behavior identical to pre-C1).
@@ -919,7 +933,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             and _w13.shape[2] == hidden_states.shape[1]
             and expert_tokens.dtype == torch.int64
             and expert_tokens.is_contiguous()
-            and 0 < _total_m <= _vgmm1_max_m
+            and 0 < _total_m <= _vgmm1_max_m_eff()
         ):
             # One-shot forensics print (host metadata, no device sync,
             # capture-safe): contract = w13 [E, N, K] ND contiguous (fmt=0);

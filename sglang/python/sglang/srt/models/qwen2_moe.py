@@ -251,6 +251,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.num_shared_experts = get_num_shared_experts(config)
         self.num_fused_shared_experts = 0
 
+        # K9 (SGLANG_NPU_MAINSTREAM_SHARED_EXPERT): fold the shared expert into
+        # the routed GMM as one extra always-active slot (E+1, top_k+1) and
+        # retire the MoE dual stream. Construct-time defenses on top of the
+        # env-level gate: unquant only, NPU local MoE path (no a2a backend),
+        # no EPLB (the extra slot id sits outside the logical expert table),
+        # matching intermediate sizes (the slot reuses the routed shard layout).
+        self.k9_shared_fused = bool(
+            _tp_fused_tail is not None
+            and _tp_fused_tail.k9_mainstream_enabled()
+            and getattr(config, "shared_expert_intermediate_size", 0) > 0
+            and config.shared_expert_intermediate_size == config.moe_intermediate_size
+            and quant_config is None
+            and get_moe_a2a_backend().is_none()
+            and not get_global_server_args().enable_eplb
+        )
+        if self.k9_shared_fused:
+            self.k9_shared_base_id = (
+                config.num_experts + get_global_server_args().ep_num_redundant_experts
+            )
+
         self.enable_shared_expert_fusion = False  # default to False
         if support_shared_expert_fusion and (
             _use_aiter or (_is_cuda and enable_cuda_shared_expert_fusion)
@@ -272,16 +292,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         _needs_hidden_after_experts = (
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
+            and not self.k9_shared_fused
         )
+        _k9_extra = 1 if self.k9_shared_fused else 0
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=(
-                config.num_experts_per_tok
+                config.num_experts_per_tok + _k9_extra
                 if not self.enable_shared_expert_fusion
                 else config.num_experts_per_tok + self.num_fused_shared_experts
             ),
             num_experts=(
-                config.num_experts + get_global_server_args().ep_num_redundant_experts
+                config.num_experts
+                + get_global_server_args().ep_num_redundant_experts
+                + _k9_extra
                 if not self.enable_shared_expert_fusion
                 else config.num_experts
                 + get_global_server_args().ep_num_redundant_experts
@@ -306,9 +330,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
+        # K9 likewise folds the shared expert into the routed GMM (appended slot),
+        # so the standalone MLP is not built either; shared_expert_gate stays
+        # (it produces the sigmoid weight of the appended slot).
         if (
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
+            and not self.k9_shared_fused
         ):
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -409,6 +437,37 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_logits=topk_output.router_logits,
         )
 
+    def _append_shared_k9(
+        self,
+        topk_output: StandardTopKOutput,
+        hidden_states: torch.Tensor,
+    ) -> StandardTopKOutput:
+        """K9: append the shared expert as one extra always-active slot
+        (id = k9_shared_base_id, weight = sigmoid(shared_expert_gate)) right
+        after routing, so the routed GMM + fin chain covers it single-stream.
+        A non-standard topk format here is a deployment inconsistency — fail
+        loudly rather than silently drop the shared contribution."""
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            raise RuntimeError(
+                "k9: expected a standard topk output to append the shared slot"
+            )
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+            fused_append_shared_experts_with_weights,
+        )
+
+        fused_topk_ids, fused_topk_weights = fused_append_shared_experts_with_weights(
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            F.sigmoid(self.shared_expert_gate(hidden_states)),
+            1,
+            N=self.k9_shared_base_id,
+        )
+        return StandardTopKOutput(
+            topk_weights=fused_topk_weights,
+            topk_ids=fused_topk_ids,
+            router_logits=topk_output.router_logits,
+        )
+
     def _forward_shared_experts(
         self, hidden_states: torch.Tensor, apply_gate: bool = True
     ):
@@ -488,6 +547,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if self.k9_shared_fused:
+            # K9: shared slot appended once here — both the deferred (fused
+            # tail) and the stock arm route through this function.
+            topk_output = self._append_shared_k9(topk_output, hidden_states)
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
@@ -602,7 +665,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
-        elif self.alt_stream is not None and get_is_capture_mode():
+        elif (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and not self.k9_shared_fused
+        ):
+            # Dual stream fork/join (retired under k9 — the appended shared
+            # slot keeps the whole MoE on the main stream).
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states, use_fused_gate=use_fused_gate, deferred=use_fused_tail
             )

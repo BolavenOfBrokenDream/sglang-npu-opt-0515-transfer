@@ -545,6 +545,11 @@ class Envs:
     SGLANG_NPU_MOE_TAIL_FUSION_AR = EnvStr("spin")
     # Log guard misses / init results once per key
     SGLANG_NPU_MOE_TAIL_FUSION_DEBUG = EnvBool(False)
+    # K9: fold the shared expert into the routed GMM as an extra always-active
+    # slot (E+1, top_k+1), retiring the MoE dual stream. Effective only when
+    # MULTI_STREAM + VGMM1 + GMM2_TRITON + MOE_TAIL_FUSION(spin) are all on;
+    # otherwise it falls back with a warning (see tp_fused_tail_npu.py).
+    SGLANG_NPU_MAINSTREAM_SHARED_EXPERT = EnvBool(False)
     # full_attention decode fusion master switch (A1b split+KV scatter /
     # A2 sigmoid_mul / A3a add_gemma_rms_norm, hardware_backend/npu/attention/
     # full_attention_fusion_npu.py); DEBUG=1 logs per-layer guard misses

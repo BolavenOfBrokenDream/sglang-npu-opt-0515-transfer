@@ -266,6 +266,53 @@ def fused_tail_ar_mode():
     return mode
 
 
+_k9_cache = None
+_k9_skip1 = None
+
+
+def k9_mainstream_enabled() -> bool:
+    """K9 (SGLANG_NPU_MAINSTREAM_SHARED_EXPERT): fold the shared expert into
+    the routed GMM as an extra always-active slot (E+1, top_k+1) and retire
+    the MoE dual stream. Allowed only on the full fusion stack — MULTI_STREAM
+    + VGMM1 + persistent GMM2 + the spin tail fusion (fin_add_ar_norm). Env
+    set but any prerequisite missing -> warn and report False (construction
+    stays byte-identical to today). Cached per process (baked before graph
+    capture; UTs must call _reset_caches_for_test() after changing env)."""
+    global _k9_cache
+    if _k9_cache is not None:
+        return _k9_cache
+    on = False
+    if _env_bool("SGLANG_NPU_MAINSTREAM_SHARED_EXPERT"):
+        missing = []
+        if not _multi_stream_on():
+            missing.append("SGLANG_NPU_USE_MULTI_STREAM")
+        if not _env_bool("SGLANG_NPU_VGMM1"):
+            missing.append("SGLANG_NPU_VGMM1")
+        if not _env_bool("SGLANG_GMM2_TRITON"):
+            missing.append("SGLANG_GMM2_TRITON")
+        if fused_tail_ar_mode() != "spin":
+            missing.append("SGLANG_NPU_MOE_TAIL_FUSION(spin)")
+        on = not missing
+        if not on:
+            logger.warning(
+                "[tp_fused_tail] SGLANG_NPU_MAINSTREAM_SHARED_EXPERT=1 ignored; "
+                "missing prerequisites: %s",
+                ", ".join(missing),
+            )
+    _k9_cache = on
+    return on
+
+
+def _k9_skip1_dummy(device):
+    """Dummy skip1 operand for the k9 form: has_skip1=0 means the kernel never
+    reads it, but the op signature still takes a tensor (the host shape checks
+    are skipped for has_skip1=0)."""
+    global _k9_skip1
+    if _k9_skip1 is None:
+        _k9_skip1 = torch.empty(16, dtype=torch.bfloat16, device=device)
+    return _k9_skip1
+
+
 def fused_tail_spin_stash_enabled() -> bool:
     """Whether qwen3_5 decoder layers should stash residual for the MoE block
     (spin variant only; hit on every forward, kept cheap — mode is cached)."""
@@ -274,11 +321,12 @@ def fused_tail_spin_stash_enabled() -> bool:
 
 def _reset_caches_for_test():
     """UT only: clear mode/op caches and the spin singleton (env untouched)."""
-    global _mode_cache, _spin_ctx, _spin_disabled
+    global _mode_cache, _spin_ctx, _spin_disabled, _k9_cache
     _mode_cache = None
     _FT_OP_CACHE.clear()
     _spin_ctx = None
     _spin_disabled = False
+    _k9_cache = None
 
 
 # ---------------------------------------------------------------------------
@@ -552,12 +600,15 @@ def fused_tail_gate(moe_block, hidden_states) -> bool:
     if mode == "spin" and _spin_disabled:
         return False
     try:
-        # Chain-structure prerequisites: shared expert present (the add's
-        # operand = skip1), not shared-expert fusion (that route has no add
-        # node), TP>1 (AR is meaningful), NPU local MoE path only —
-        # a2a_backend.is_none() excludes deepep/fuseep/megamoe/flashinfer/
-        # mooncake/mori/nixl in one shot.
-        if moe_block.shared_expert is None:
+        # Chain-structure prerequisites: a shared-expert operand is present —
+        # either the standalone MLP (the add's operand = skip1) or the k9 form
+        # (folded into the routed GMM, has_skip1=0); not shared-expert fusion
+        # (that route has no add node), TP>1 (AR is meaningful), NPU local MoE
+        # path only — a2a_backend.is_none() excludes deepep/fuseep/megamoe/
+        # flashinfer/mooncake/mori/nixl in one shot.
+        if moe_block.shared_expert is None and not getattr(
+            moe_block, "k9_shared_fused", False
+        ):
             return False
         if getattr(moe_block, "enable_shared_expert_fusion", False):
             return False
@@ -622,8 +673,21 @@ def fused_tail_finish(moe_block, pieces, shared_output, residual, num_tokens, hi
     mode = fused_tail_ar_mode()
     xp, eri, scales = pieces.xexp, pieces.eri, pieces.scales_fp32
     if shared_output is None:
-        raise RuntimeError("fused_tail: shared_output is None (gate required shared_expert present)")
-    m, h = shared_output.shape[0], shared_output.shape[-1]
+        # K9 form: the shared expert is folded into the routed GMM (its
+        # contribution is the k-th fin term), so the skip1 add is retired —
+        # feed a dummy with has_skip1=0 (spin only, per the k9 gate).
+        if not getattr(moe_block, "k9_shared_fused", False):
+            raise RuntimeError(
+                "fused_tail: shared_output is None (gate required shared_expert present)"
+            )
+        if mode != "spin":
+            raise RuntimeError("fused_tail: the k9 form requires the spin variant")
+        m, h = scales.shape[0], xp.shape[-1]
+        shared_output = _k9_skip1_dummy(xp.device)
+        has_skip1 = 0
+    else:
+        m, h = shared_output.shape[0], shared_output.shape[-1]
+        has_skip1 = 1
     k = scales.shape[-1]
     # v4.1: scales are fed as fp32/bf16 directly (bf16 is widened exactly
     # in-kernel, bitwise-equal to .float()) — the v4 .float() fallback issued a
@@ -672,7 +736,7 @@ def fused_tail_finish(moe_block, pieces, shared_output, residual, num_tokens, hi
     fctx = _FusedTailCtx(
         xexp=xp, scales=scales, skip1=shared_output, residual=residual,
         eri=eri, add_out=add_out, norm_out=norm_out, spin_ctx=ctx,
-        m=m, h=h, k=k,
+        m=m, h=h, k=k, has_skip1=has_skip1,
     )
     out = norm_out.view(num_tokens, hidden_dim)
     out._sglang_fused_tail_ctx = fctx  # input references kept alive via ctx until launch
@@ -685,10 +749,10 @@ class _FusedTailCtx:
     GemmaRMSNorm.forward_npu). Holds all input references alive."""
 
     __slots__ = ("xexp", "scales", "skip1", "residual", "eri",
-                 "add_out", "norm_out", "spin_ctx", "m", "h", "k")
+                 "add_out", "norm_out", "spin_ctx", "m", "h", "k", "has_skip1")
 
     def __init__(self, xexp, scales, skip1, residual, eri, add_out, norm_out,
-                 spin_ctx, m, h, k):
+                 spin_ctx, m, h, k, has_skip1=1):
         self.xexp = xexp
         self.scales = scales
         self.skip1 = skip1
@@ -700,6 +764,7 @@ class _FusedTailCtx:
         self.m = m
         self.h = h
         self.k = k
+        self.has_skip1 = has_skip1
 
 
 # ---------------------------------------------------------------------------
@@ -738,7 +803,7 @@ def maybe_consume_fused_tail_ctx(x, norm_module):
         fctx.add_out, fctx.norm_out, ctx.addr_tab,
         fctx.eri, w,
         fctx.m, fctx.h, fctx.k, _FT_NCORES, ctx.rank, ctx.world,
-        1, 1, float(norm_module.variance_epsilon), _FT_CYCLE_LIMIT_US,
+        fctx.has_skip1, 1, float(norm_module.variance_epsilon), _FT_CYCLE_LIMIT_US,
         ctx.slot_stride, ctx.ring_stride, ctx.max_tiles,
         _FT_COUNTER_OFFSET, _FT_DFX_OFFSET,
     )

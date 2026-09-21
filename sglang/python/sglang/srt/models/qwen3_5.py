@@ -1827,6 +1827,72 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
 
+# K9: standalone shared-expert MLP weights are loaded into the appended slot
+# of the fused-expert tensors (gate/up -> w13 shards w1/w3, down -> w2 shard
+# w2); the slot index is the last one (routed + redundant, then shared).
+_K9_SHARED_EXPERT_WEIGHT_MAPPING = (
+    ("gate_proj", "w13_weight", "w1"),
+    ("up_proj", "w13_weight", "w3"),
+    ("down_proj", "w2_weight", "w2"),
+)
+
+
+def _k9_load_shared_expert_weight(name, loaded_weight, params_dict):
+    """Route one standalone shared-expert weight into the appended GMM slot.
+
+    Returns the mapped param name, or None when the name is not a
+    shared-expert MLP weight or k9 is not active on that block (the
+    standalone MLP params then exist and load as usual). Must run before the
+    stacked-params mapping, which would otherwise rewrite gate_proj ->
+    gate_up_proj and silently drop these weights when the MLP is not built.
+    """
+    if ".mlp.shared_expert." not in name or ".shared_expert_gate." in name:
+        return None
+    prefix = name.split(".mlp.shared_expert.")[0]
+    if f"{prefix}.mlp.shared_expert.gate_up_proj.weight" in params_dict:
+        return None  # standalone shared expert exists — k9 not active here
+    if name.endswith(".mlp.shared_expert.gate_up_proj.weight"):
+        # Fused gate/up checkpoint tensor: split into the w1/w3 halves.
+        gate_w, up_w = loaded_weight.chunk(2, dim=-2)
+        name_mapped = name.replace(
+            ".mlp.shared_expert.gate_up_proj.weight", ".mlp.experts.w13_weight"
+        )
+        param = params_dict.get(name_mapped)
+        if param is None:
+            raise RuntimeError(
+                f"k9: {name_mapped} missing while the standalone shared-expert "
+                "MLP is absent (MoE block built without the extra slot?)"
+            )
+        expert_id = param.shape[0] - 1
+        param.weight_loader(
+            param, gate_w, name_mapped, shard_id="w1", expert_id=expert_id
+        )
+        param.weight_loader(
+            param, up_w, name_mapped, shard_id="w3", expert_id=expert_id
+        )
+        return name_mapped
+    for proj, expert_param, shard_id in _K9_SHARED_EXPERT_WEIGHT_MAPPING:
+        marker = f".mlp.shared_expert.{proj}.weight"
+        if marker not in name:
+            continue
+        name_mapped = name.replace(marker, f".mlp.experts.{expert_param}")
+        param = params_dict.get(name_mapped)
+        if param is None:
+            raise RuntimeError(
+                f"k9: {name_mapped} missing while the standalone shared-expert "
+                "MLP is absent (MoE block built without the extra slot?)"
+            )
+        param.weight_loader(
+            param,
+            loaded_weight,
+            name_mapped,
+            shard_id=shard_id,
+            expert_id=param.shape[0] - 1,
+        )
+        return name_mapped
+    return None
+
+
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     def __init__(
         self,
@@ -1926,6 +1992,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
+                continue
+
+            k9_name = _k9_load_shared_expert_weight(name, loaded_weight, params_dict)
+            if k9_name is not None:
+                loaded_params.add(k9_name)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -2410,6 +2481,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
+                continue
+
+            k9_name = _k9_load_shared_expert_weight(name, loaded_weight, params_dict)
+            if k9_name is not None:
+                loaded_params.add(k9_name)
                 continue
 
             if self.enable_shared_expert_fusion:
