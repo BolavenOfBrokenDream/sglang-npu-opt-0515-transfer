@@ -270,6 +270,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.k9_shared_base_id = (
                 config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
+            # K9 gate pack: the router gate (E rows) and shared_expert_gate
+            # (1 row) weights packed into a single [N_pack, H] tensor,
+            # N_pack = E+1 zero-padded up to a multiple of 16 (the
+            # k9_gate_pack_probe form), so the two mainstream GEMMs around
+            # MoeGatingTopK collapse into one. Built after weight loading by
+            # build_k9_gate_packs() (the load_weights tail hook); while None
+            # the forward falls back to the two separate GEMMs (identical
+            # semantics, one extra matmul launch).
+            self.k9_gate_pack_weight = None
+            self.k9_gate_pack_router_n = 0
 
         self.enable_shared_expert_fusion = False  # default to False
         if support_shared_expert_fusion and (
@@ -437,14 +447,35 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_logits=topk_output.router_logits,
         )
 
+    def build_k9_gate_pack(self):
+        """K9: pack the router-gate and shared_expert_gate weights into one
+        [N_pack, H] tensor (E+1 rows zero-padded up to a multiple of 16 —
+        the k9_gate_pack_probe form; the padding keeps the GEMM N dim on
+        the validated tiling). Idempotent — a rebuild picks up hot-updated
+        weights. No-op when k9 is not active on this block."""
+        if not self.k9_shared_fused:
+            return
+        w_router = self.gate.weight
+        w_shared = self.shared_expert_gate.weight
+        n_router = w_router.shape[0]
+        n_pack = (n_router + 1 + 15) // 16 * 16
+        pack = w_router.new_zeros((n_pack, w_router.shape[1]))
+        pack[:n_router].copy_(w_router)
+        pack[n_router].copy_(w_shared.reshape(w_router.shape[1]))
+        self.k9_gate_pack_router_n = n_router
+        self.k9_gate_pack_weight = pack
+
     def _append_shared_k9(
         self,
         topk_output: StandardTopKOutput,
         hidden_states: torch.Tensor,
+        shared_gate_logits: Optional[torch.Tensor] = None,
     ) -> StandardTopKOutput:
         """K9: append the shared expert as one extra always-active slot
         (id = k9_shared_base_id, weight = sigmoid(shared_expert_gate)) right
         after routing, so the routed GMM + fin chain covers it single-stream.
+        shared_gate_logits comes from the packed gate GEMM when the gate
+        pack is built; otherwise the standalone shared_expert_gate runs here.
         A non-standard topk format here is a deployment inconsistency — fail
         loudly rather than silently drop the shared contribution."""
         if not TopKOutputChecker.format_is_standard(topk_output):
@@ -455,10 +486,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             fused_append_shared_experts_with_weights,
         )
 
+        if shared_gate_logits is None:
+            shared_gate_logits = self.shared_expert_gate(hidden_states)
         fused_topk_ids, fused_topk_weights = fused_append_shared_experts_with_weights(
             topk_output.topk_ids,
             topk_output.topk_weights,
-            F.sigmoid(self.shared_expert_gate(hidden_states)),
+            F.sigmoid(shared_gate_logits),
             1,
             N=self.k9_shared_base_id,
         )
@@ -544,13 +577,28 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor, deferred: bool = False):
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        shared_gate_logits = None
+        if self.k9_shared_fused and self.k9_gate_pack_weight is not None:
+            # K9 gate pack: one GEMM ([T,H] x [N_pack,H]) covers both the
+            # router gate and the shared gate; slice the two logits apart.
+            # The router slice goes contiguous (the probe-validated form —
+            # feeding the strided view also passes the topk op, but the copy
+            # keeps every downstream layout contract untouched); the shared
+            # column slice is sigmoid'ed into the appended slot weight.
+            n_router = self.k9_gate_pack_router_n
+            packed_logits = F.linear(hidden_states, self.k9_gate_pack_weight)
+            router_logits = packed_logits[:, :n_router].contiguous()
+            shared_gate_logits = packed_logits[:, n_router : n_router + 1]
+        else:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if self.k9_shared_fused:
             # K9: shared slot appended once here — both the deferred (fused
             # tail) and the stock arm route through this function.
-            topk_output = self._append_shared_k9(topk_output, hidden_states)
+            topk_output = self._append_shared_k9(
+                topk_output, hidden_states, shared_gate_logits
+            )
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
@@ -721,6 +769,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Debug removed - was causing issues during CUDA graph capture
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+def build_k9_gate_packs(model: nn.Module) -> int:
+    """K9: (re)build the packed router+shared gate weight on every k9-active
+    Qwen2MoeSparseMoeBlock under `model`. Idempotent; call after weight
+    loading (the load_weights tail hook, next to the fused-tail spin ctx
+    init — device-side weight copies must not first happen during graph
+    capture). Returns the number of blocks packed."""
+    n = 0
+    for module in model.modules():
+        if isinstance(module, Qwen2MoeSparseMoeBlock) and module.k9_shared_fused:
+            module.build_k9_gate_pack()
+            n += 1
+    if n:
+        logger.info("k9: gate pack built on %d MoE block(s)", n)
+    return n
 
 
 class Qwen2MoeAttention(nn.Module):

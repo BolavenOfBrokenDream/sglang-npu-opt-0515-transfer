@@ -553,7 +553,8 @@ class Envs:
     SGLANG_NPU_MOE_TAIL_FUSION_DEBUG = EnvBool(False)
     # K9: fold the shared expert into the routed GMM as an extra always-active
     # slot (E+1, top_k+1), retiring the MoE dual stream. Effective only when
-    # MULTI_STREAM + VGMM1 + GMM2_TRITON + MOE_TAIL_FUSION(spin) are all on;
+    # MULTI_STREAM + GMM2_TRITON + MOE_TAIL_FUSION(spin) are all on (VGMM1
+    # optional — off means the w13 GMM1 stays on stock npu_grouped_matmul);
     # otherwise it falls back with a warning (see tp_fused_tail_npu.py).
     SGLANG_NPU_MAINSTREAM_SHARED_EXPERT = EnvBool(False)
     # full_attention decode fusion master switch (A1b split+KV scatter /

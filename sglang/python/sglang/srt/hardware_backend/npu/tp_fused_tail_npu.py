@@ -273,11 +273,14 @@ _k9_skip1 = None
 def k9_mainstream_enabled() -> bool:
     """K9 (SGLANG_NPU_MAINSTREAM_SHARED_EXPERT): fold the shared expert into
     the routed GMM as an extra always-active slot (E+1, top_k+1) and retire
-    the MoE dual stream. Allowed only on the full fusion stack — MULTI_STREAM
-    + VGMM1 + persistent GMM2 + the spin tail fusion (fin_add_ar_norm). Env
-    set but any prerequisite missing -> warn and report False (construction
-    stays byte-identical to today). Cached per process (baked before graph
-    capture; UTs must call _reset_caches_for_test() after changing env)."""
+    the MoE dual stream. Allowed when MULTI_STREAM + persistent GMM2 +
+    the spin tail fusion (fin_add_ar_norm) are all on. VGMM1 is recommended
+    but not required: with SGLANG_NPU_VGMM1=0 the w13 GMM1 stays on stock
+    npu_grouped_matmul (the 257-slot weight works there unchanged) at a
+    GMM1 perf cost. Env set but any prerequisite missing -> warn and report
+    False (construction stays byte-identical to today). Cached per process
+    (baked before graph capture; UTs must call _reset_caches_for_test()
+    after changing env)."""
     global _k9_cache
     if _k9_cache is not None:
         return _k9_cache
@@ -286,8 +289,6 @@ def k9_mainstream_enabled() -> bool:
         missing = []
         if not _multi_stream_on():
             missing.append("SGLANG_NPU_USE_MULTI_STREAM")
-        if not _env_bool("SGLANG_NPU_VGMM1"):
-            missing.append("SGLANG_NPU_VGMM1")
         if not _env_bool("SGLANG_GMM2_TRITON"):
             missing.append("SGLANG_GMM2_TRITON")
         if fused_tail_ar_mode() != "spin":
@@ -298,6 +299,11 @@ def k9_mainstream_enabled() -> bool:
                 "[tp_fused_tail] SGLANG_NPU_MAINSTREAM_SHARED_EXPERT=1 ignored; "
                 "missing prerequisites: %s",
                 ", ".join(missing),
+            )
+        elif not _env_bool("SGLANG_NPU_VGMM1"):
+            logger.info(
+                "[tp_fused_tail] K9 active without SGLANG_NPU_VGMM1: "
+                "w13 GMM1 stays on stock npu_grouped_matmul"
             )
     _k9_cache = on
     return on

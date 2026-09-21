@@ -98,6 +98,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2_moe import (
     Qwen2MoeMLP,
     Qwen2MoeSparseMoeBlock,
+    build_k9_gate_packs,
     can_fuse_shared_expert,
 )
 
@@ -2131,6 +2132,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             _tp_fused_tail.maybe_init_fused_tail_spin(
                 hidden_size=self.config.hidden_size
             )
+        # K9 gate pack: router gate + shared_expert_gate packed into one GEMM
+        # weight per k9-active MoE block (idempotent rebuild after loading;
+        # no-op when k9 is off).
+        build_k9_gate_packs(self)
         return loaded_params
 
 
@@ -2298,6 +2303,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     self.config, "text_config", self.config
                 ).hidden_size
             )
+        # K9 gate pack: same story as the spin ctx init — the VL wrappers do
+        # not go through the inner CausalLM load_weights, so each one
+        # rebuilds the packed gate weights here (idempotent).
+        build_k9_gate_packs(self)
         return loaded_params
 
 
@@ -2692,6 +2701,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     self.config, "text_config", self.config
                 ).hidden_size
             )
+        # K9 gate pack: same story as the spin ctx init — the VL wrappers do
+        # not go through the inner CausalLM load_weights, so each one
+        # rebuilds the packed gate weights here (idempotent).
+        build_k9_gate_packs(self)
         return loaded_params
 
     @property
